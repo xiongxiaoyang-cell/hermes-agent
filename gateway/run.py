@@ -11028,11 +11028,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         logger.info("Skipping signal handlers (not running in main thread).")
     
     # Claim the PID file BEFORE bringing up any platform adapters.
-    # This closes the --replace race window: two concurrent `gateway run
-    # --replace` invocations both pass the termination-wait above, but
-    # only the winner of the O_CREAT|O_EXCL race below will ever open
-    # Telegram polling, Discord gateway sockets, etc. The loser exits
-    # cleanly before touching any external service.
+    # After a replace=True handoff the old PID file has been removed, but
+    # use force=True to also handle any stale file left by a crashed predecessor
+    # (e.g. the old process was kill -9'd and never cleaned up).
     import atexit
     from gateway.status import write_pid_file, remove_pid_file, get_running_pid
     _current_pid = get_running_pid()
@@ -11048,7 +11046,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         )
         return False
     try:
-        write_pid_file()
+        write_pid_file(force=True)  # force: replace stale file from dead predecessor
     except FileExistsError:
         release_gateway_runtime_lock()
         logger.error(

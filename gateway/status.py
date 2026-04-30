@@ -364,20 +364,60 @@ def is_gateway_runtime_lock_active(lock_path: Optional[Path] = None) -> bool:
             pass
 
 
-def write_pid_file() -> None:
+def write_pid_file(*, force: bool = False) -> None:
     """Write the current process PID and metadata to the gateway PID file.
 
-    Uses atomic O_CREAT | O_EXCL creation so that concurrent --replace
-    invocations race: exactly one process wins and the rest get
-    FileExistsError.
+    Uses O_CREAT | O_EXCL on first attempt so that concurrent --replace
+    invocations racing to write get FileExistsError for the loser.
+    When force=True, os.rename() is used instead to atomically replace
+    a stale PID file left by a crashed predecessor (no other gateway
+    is actually running).
+
+    Args:
+        force: If True, unlink any existing PID file (after verifying its
+               process is dead) before writing.  Use when the gateway is
+               the sole instance and the old PID file is definitely stale.
     """
     path = _get_pid_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     record = json.dumps(_build_pid_record())
+
+    # ── Fast path: O_EXCL succeeds (no competing gateway) ───────────────
+    fd = None
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
-        raise  # Let caller decide: another gateway is racing us
+        # ── Slow path: PID file already exists ──────────────────────────
+        if not force:
+            raise  # Caller must handle FileExistsError.
+        # The caller has verified no other gateway is alive.
+        # As a safety net, also check here: if the recorded PID is still
+        # alive, do NOT unlink (another gateway is genuinely running).
+        old_record = _read_pid_record(path)
+        if old_record is not None:
+            try:
+                old_pid = int(old_record["pid"])
+                os.kill(old_pid, 0)  # signal 0 = existence check
+                # PID is alive — do not steal the file.
+                raise FileExistsError(
+                    f"PID {old_pid} is still alive; cannot force-write. "
+                    "Use replace=False or stop the old gateway first."
+                )
+            except (ProcessLookupError, PermissionError, ValueError, KeyError, TypeError):
+                pass  # Stale file — safe to replace.
+        # Remove the stale file and replace it atomically.
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        # Retry once — should succeed now.
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            # Still races with another writer; propagate.
+            raise
+
+    # ── Write the PID record (runs after either fast or slow path) ──
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(record)

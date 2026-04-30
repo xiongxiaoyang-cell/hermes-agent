@@ -4250,8 +4250,11 @@ class HermesCLI:
 
         agent = getattr(self, "agent", None)
         total_tokens = getattr(agent, "session_total_tokens", 0) or 0
-        provider = getattr(self, "provider", None) or "unknown"
-        model = getattr(self, "model", None) or "(unknown)"
+        input_tokens = getattr(agent, "session_input_tokens", 0) or 0
+        output_tokens = getattr(agent, "session_output_tokens", 0) or 0
+        cache_read = getattr(agent, "session_cache_read_tokens", 0) or 0
+        provider = getattr(agent, "provider", None) or "unknown"
+        model = getattr(agent, "model", None) or "(unknown)"
         is_running = bool(getattr(self, "_agent_running", False))
 
         lines = [
@@ -4266,7 +4269,7 @@ class HermesCLI:
             f"Model: {model} ({provider})",
             f"Created: {created_at.strftime('%Y-%m-%d %H:%M')}",
             f"Last Activity: {updated_at.strftime('%Y-%m-%d %H:%M')}",
-            f"Tokens: {total_tokens:,}",
+            f"Tokens: {total_tokens:,} (in={input_tokens:,} out={output_tokens:,} cache={cache_read:,})",
             f"Agent Running: {'Yes' if is_running else 'No'}",
         ])
         self._console_print("\n".join(lines), highlight=False, markup=False)

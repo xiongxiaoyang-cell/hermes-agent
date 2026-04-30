@@ -16,6 +16,8 @@ import logging
 import os
 import subprocess
 import sys
+import threading
+import time
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -39,7 +41,6 @@ from hermes_cli.config import load_config
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
-
 
 def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     """Resolve the toolset list for a cron job.
@@ -70,6 +71,62 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
             exc,
         )
         return None
+
+
+# =============================================================================
+# Cron job watchdog — Layer 2 defence
+# =============================================================================
+# Module-level registry shared between run_job() and the watchdog thread.
+# {job_id: {"future", "agent", "start_time", "timeout_secs", "done"}}
+# Starts as None; first run_job() call initialises it and spawns the watchdog.
+_CRON_WATCHDOG_REGISTRY: Optional[dict] = None
+_WATCHDOG_SHUTDOWN: Optional[threading.Event] = None
+
+_WATCHDOG_CHECK_INTERVAL = 30  # seconds between watchdog sweeps
+
+
+def _cron_watchdog_loop() -> None:
+    """Background thread that monitors running cron jobs for wall-clock timeout.
+
+    Fires when a job has been running longer than its timeout_minutes.  Calls
+    agent.interrupt() to set the interrupt flag; the next API/tool call in the
+    agent's loop will observe the flag and raise InterruptedError, causing
+    run_job() to abort cleanly.
+    """
+    global _CRON_WATCHDOG_REGISTRY, _WATCHDOG_SHUTDOWN
+    while True:
+        try:
+            if _WATCHDOG_SHUTDOWN is not None and _WATCHDOG_SHUTDOWN.is_set():
+                break
+            if _CRON_WATCHDOG_REGISTRY is None:
+                time.sleep(_WATCHDOG_CHECK_INTERVAL)
+                continue
+            now = _hermes_now()
+            for job_id, meta in list(_CRON_WATCHDOG_REGISTRY.items()):
+                if meta.get("done"):
+                    continue
+                elapsed = (now - meta["start_time"]).total_seconds()
+                if elapsed >= meta["timeout_secs"]:
+                    agent = meta.get("agent")
+                    if agent is not None and hasattr(agent, "interrupt"):
+                        try:
+                            agent.interrupt(
+                                f"Watchdog: job {job_id} exceeded "
+                                f"{meta['timeout_secs']}s wall-clock limit"
+                            )
+                        except Exception:
+                            pass
+                    try:
+                        meta["future"].cancel()
+                    except Exception:
+                        pass
+                    logger.warning(
+                        "Watchdog: cancelled job %s (elapsed=%.0fs, limit=%ds)",
+                        job_id, elapsed, meta["timeout_secs"],
+                    )
+        except Exception:
+            pass  # Never let the watchdog thread crash the process
+        time.sleep(_WATCHDOG_CHECK_INTERVAL)
 
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
@@ -404,9 +461,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         # Prefer the live adapter when the gateway is running — this supports E2EE
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
+        # Exception: Feishu cron delivery bypasses live adapter because the
+        # Feishu WebSocket connection is owned by the gateway's main loop and
+        # can silently misbehave in the tick thread, causing silent delivery
+        # failures (message goes to wrong chat) with no error raised.
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
-        if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
+        _skip_live_adapter = (platform == Platform.FEISHU)
+        if (not _skip_live_adapter) and runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
             send_metadata = {"thread_id": thread_id} if thread_id else None
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
@@ -476,7 +538,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.append(msg)
                 continue
 
-            logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+            logger.info(
+                "Job '%s': delivered to %s:%s via standalone (msg_id=%s)",
+                job["id"], platform_name, chat_id,
+                (result or {}).get("message_id", "unknown") if isinstance(result, dict) else "unknown",
+            )
 
     if delivery_errors:
         return "; ".join(delivery_errors)
@@ -1018,52 +1084,98 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             session_db=_session_db,
         )
         
-        # Run the agent with an *inactivity*-based timeout: the job can run
-        # for hours if it's actively calling tools / receiving stream tokens,
-        # but a hung API call or stuck tool with no activity for the configured
-        # duration is caught and killed.  Default 600s (10 min inactivity);
-        # override via HERMES_CRON_TIMEOUT env var.  0 = unlimited.
-        #
-        # Uses the agent's built-in activity tracker (updated by
-        # _touch_activity() on every tool call, API call, and stream delta).
+        # =============================================================================
+        # Layer 1: Wall-clock timeout (per-job, from job.timeout_minutes field)
+        # =============================================================================
+        # Absolute time limit: however active the job is, it is killed after this long.
+        # Default 35 min; override per-job via timeout_minutes field.
+        # This is the primary defence against hung API calls that keep resetting
+        # the inactivity tracker (e.g. a Tavily search that hangs for 45 min).
+        _wall_clock_limit_secs = (job.get("timeout_minutes") or 35) * 60
+
+        # =============================================================================
+        # Layer 2: Inactivity timeout (HERMES_CRON_TIMEOUT env var, default 10 min)
+        # Secondary defence: catches jobs that stop making progress but are still
+        # technically alive (e.g. broken tool with no timeout of its own).
+        # =============================================================================
         _cron_timeout = float(os.getenv("HERMES_CRON_TIMEOUT", 600))
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
         _POLL_INTERVAL = 5.0
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        # Preserve scheduler-scoped ContextVar state (for example skill-declared
-        # env passthrough registrations) when the cron run hops into the worker
-        # thread used for inactivity timeout monitoring.
+
+        # Global watchdog registry — accessed from the watchdog thread below.
+        # Structure: {job_id: {"future", "agent", "start_time", "timeout_secs", "done"}}
+        # Initialised once per process at module import; thread-safe via Python GIL.
+        global _CRON_WATCHDOG_REGISTRY
+        if _CRON_WATCHDOG_REGISTRY is None:
+            _CRON_WATCHDOG_REGISTRY = {}
+            _WATCHDOG_SHUTDOWN = threading.Event()
+            _WATCHDOG_SHUTDOWN.clear()
+            _watchdog_thread = threading.Thread(
+                target=_cron_watchdog_loop,
+                name="cron-watchdog",
+                daemon=True,
+            )
+            _watchdog_thread.start()
+
         _cron_context = contextvars.copy_context()
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        _start_time = _hermes_now()
+        _CRON_WATCHDOG_REGISTRY[job_id] = {
+            "future": _cron_future,
+            "agent": agent,
+            "start_time": _start_time,
+            "timeout_secs": _wall_clock_limit_secs,
+            "done": False,
+        }
         _inactivity_timeout = False
+        _wall_clock_timeout = False
         try:
-            if _cron_inactivity_limit is None:
+            if _cron_inactivity_limit is None and _wall_clock_limit_secs <= 0:
                 # Unlimited — just wait for the result.
                 result = _cron_future.result()
             else:
                 result = None
                 while True:
+                    # Poll with the smaller of the two remaining intervals so the
+                    # watchdog fires as soon as any limit is breached.
+                    _remaining_wall = _wall_clock_limit_secs - (
+                        (_hermes_now() - _start_time).total_seconds()
+                    )
+                    _poll = min(
+                        _POLL_INTERVAL,
+                        _remaining_wall if _wall_clock_limit_secs > 0 else _POLL_INTERVAL,
+                    )
                     done, _ = concurrent.futures.wait(
-                        {_cron_future}, timeout=_POLL_INTERVAL,
+                        {_cron_future}, timeout=_poll,
                     )
                     if done:
                         result = _cron_future.result()
                         break
-                    # Agent still running — check inactivity.
-                    _idle_secs = 0.0
-                    if hasattr(agent, "get_activity_summary"):
-                        try:
-                            _act = agent.get_activity_summary()
-                            _idle_secs = _act.get("seconds_since_activity", 0.0)
-                        except Exception:
-                            pass
-                    if _idle_secs >= _cron_inactivity_limit:
-                        _inactivity_timeout = True
+                    # Agent still running — check both limits.
+                    _wall_elapsed = (
+                        (_hermes_now() - _start_time).total_seconds()
+                    )
+                    if _wall_elapsed >= _wall_clock_limit_secs:
+                        _wall_clock_timeout = True
                         break
+                    if _cron_inactivity_limit is not None:
+                        _idle_secs = 0.0
+                        if hasattr(agent, "get_activity_summary"):
+                            try:
+                                _act = agent.get_activity_summary()
+                                _idle_secs = _act.get("seconds_since_activity", 0.0)
+                            except Exception:
+                                pass
+                        if _idle_secs >= _cron_inactivity_limit:
+                            _inactivity_timeout = True
+                            break
         except Exception:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
             raise
         finally:
+            # Remove from watchdog registry so the watchdog stops tracking this job.
+            _CRON_WATCHDOG_REGISTRY.pop(job_id, None)
             _cron_pool.shutdown(wait=False, cancel_futures=True)
 
         if _inactivity_timeout:
@@ -1099,6 +1211,35 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         if not isinstance(result, dict):
             raise RuntimeError(
                 f"agent.run_conversation returned {type(result).__name__} instead of dict: {result!r}"
+            )
+
+        if _wall_clock_timeout:
+            _wall_elapsed = int(
+                (_hermes_now() - _start_time).total_seconds()
+            )
+            _activity = {}
+            if hasattr(agent, "get_activity_summary"):
+                try:
+                    _activity = agent.get_activity_summary()
+                except Exception:
+                    pass
+            _last_desc = _activity.get("last_activity_desc", "unknown")
+            _cur_tool = _activity.get("current_tool")
+            _iter_n = _activity.get("api_call_count", 0)
+            _iter_max = _activity.get("max_iterations", 0)
+
+            logger.error(
+                "Job '%s' wall-clock timeout after %ds (limit %ds) "
+                "| last_activity=%s | iteration=%s/%s | tool=%s",
+                job_name, _wall_elapsed, _wall_clock_limit_secs,
+                _last_desc, _iter_n, _iter_max,
+                _cur_tool or "none",
+            )
+            if hasattr(agent, "interrupt"):
+                agent.interrupt("Cron job timed out (wall-clock)")
+            raise TimeoutError(
+                f"Cron job '{job_name}' timed out after "
+                f"{_wall_elapsed}s (wall-clock limit {_wall_clock_limit_secs}s)"
             )
 
         final_response = result.get("final_response", "") or ""
