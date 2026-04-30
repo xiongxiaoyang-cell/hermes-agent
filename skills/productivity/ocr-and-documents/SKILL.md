@@ -12,8 +12,8 @@ metadata:
 
 # PDF & Document Extraction
 
-For DOCX: use `python-docx` (parses actual document structure, far better than OCR).
-For PPTX: see the `powerpoint` skill (uses `python-pptx` with full slide/notes support).
+For DOCX/PPTX/XLSX: use **markitdown** (unified, Microsoft official, handles tables correctly — python-docx has a known bug where tables return empty).
+For PPTX: see also the `powerpoint` skill (python-pptx for editing).
 This skill covers **PDFs and scanned documents**.
 
 ## Step 1: Remote URL Available?
