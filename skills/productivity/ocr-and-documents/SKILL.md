@@ -1,6 +1,6 @@
 ---
 name: ocr-and-documents
-description: Extract text from PDFs and scanned documents. Use web_extract for remote URLs, pymupdf for local text-based PDFs, marker-pdf for OCR/scanned docs. For DOCX use python-docx, for PPTX see the powerpoint skill.
+description: Extract text from PDFs and scanned documents. Use web_extract for remote URLs, pymupdf for local text-based PDFs, marker-pdf for OCR/scanned docs. For DOCX/PPTX/XLSX use markitdown (python-docx has a known table bug).
 version: 2.3.0
 author: Hermes Agent
 license: MIT
@@ -167,5 +167,5 @@ No extra dependencies needed — pymupdf covers split, merge, search, and text e
 - marker-pdf is for OCR, scanned docs, equations, complex layouts — install only when needed
 - Both helper scripts accept `--help` for full usage
 - marker-pdf downloads ~2.5GB of models to `~/.cache/huggingface/` on first use
-- For Word docs: `pip install python-docx` (better than OCR — parses actual structure)
-- For PowerPoint: see the `powerpoint` skill (uses python-pptx)
+- For DOCX/PPTX/XLSX: use **markitdown** (unified, correct table handling)
+- For Word docs with table bugs in python-docx: see `document-extraction-gene`
