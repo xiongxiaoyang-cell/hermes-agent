@@ -322,8 +322,8 @@ class StreamingConfig:
     enabled: bool = False
     transport: str = "edit"       # "edit" (progressive editMessageText) or "off"
     edit_interval: float = 1.0    # Seconds between message edits (Telegram rate-limits at ~1/s)
-    buffer_threshold: int = 40    # Chars before forcing an edit
-    cursor: str = " ▉"           # Cursor shown during streaming
+    buffer_threshold: int = 2000
+    cursor: str = ""
     # Ported from openclaw/openclaw#72038.  When >0, the final edit for
     # a long-running streamed response is delivered as a fresh message
     # if the original preview has been visible for at least this many
@@ -443,6 +443,12 @@ class GatewayConfig:
     # months.  Pruning is invisible to users — if they resume, they get a
     # fresh session exactly as if the reset policy had fired.  0 = disabled.
     session_store_max_age_days: int = 90
+
+    # Agent-level settings (mirrors agent section in config.yaml)
+    class _AgentConfig:
+        persona_id: str = "kaige"
+        max_turns: int = 90
+    agent: _AgentConfig = field(default_factory=_AgentConfig)
 
     def get_connected_platforms(self) -> List[Platform]:
         """Return list of platforms that are enabled and configured."""
@@ -702,6 +708,15 @@ def load_gateway_config() -> GatewayConfig:
 
             if "always_log_local" in yaml_cfg:
                 gw_data["always_log_local"] = yaml_cfg["always_log_local"]
+
+            # Load agent section (persona_id, etc.)
+            agent_cfg = yaml_cfg.get("agent")
+            if isinstance(agent_cfg, dict):
+                agent_data = gw_data.setdefault("agent", {})
+                if isinstance(agent_data, dict):
+                    for _key in ("persona_id",):
+                        if _key in agent_cfg:
+                            agent_data[_key] = agent_cfg[_key]
 
             if "unauthorized_dm_behavior" in yaml_cfg:
                 gw_data["unauthorized_dm_behavior"] = _normalize_unauthorized_dm_behavior(

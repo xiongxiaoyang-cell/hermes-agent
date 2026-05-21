@@ -95,6 +95,8 @@ def format_runtime_footer(
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
+    elapsed_time: Optional[float] = None,
+    success: Optional[bool] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
@@ -116,6 +118,18 @@ def format_runtime_footer(
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
                 parts.append(rel)
+        elif field == "elapsed_time":
+            if elapsed_time is not None and elapsed_time >= 0:
+                parts.append(f"⏱️ {elapsed_time:.1f}s")
+        elif field == "status":
+            if success is True:
+                parts.append("✅")
+            elif success is False:
+                parts.append("❌")
+        elif field == "agent":
+            agent_val = os.environ.get("HERMES_FOOTER_AGENT", "Hermes")
+            if agent_val:
+                parts.append(agent_val)
         # Unknown field names are silently ignored.
 
     if not parts:
@@ -131,6 +145,8 @@ def build_footer_line(
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
+    elapsed_time: Optional[float] = None,
+    success: Optional[bool] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -146,5 +162,7 @@ def build_footer_line(
         context_tokens=context_tokens,
         context_length=context_length,
         cwd=cwd,
+        elapsed_time=elapsed_time,
+        success=success,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )

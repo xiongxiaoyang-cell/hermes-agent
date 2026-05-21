@@ -64,7 +64,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Sequence
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -305,6 +305,11 @@ _SKIP_TEXT_KEYS = {
     "template",
     "locale",
 }
+
+
+def utf8_len(s: str) -> int:
+    """Return the byte length of a UTF-8 encoded string (Feishu API limit)."""
+    return len(s.encode("utf-8"))
 
 
 @dataclass(frozen=True)
@@ -1700,18 +1705,20 @@ class FeishuAdapter(BasePlatformAdapter):
         content: str,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        chat_type: Optional[str] = None,
     ) -> SendResult:
         """Send a Feishu message."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
         formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf8_len)
         last_response = None
 
         try:
             for chunk in chunks:
-                msg_type, payload = self._build_outbound_payload(chunk)
+                msg_type, payload = self._build_outbound_payload(chunk, chat_type=chat_type)
                 try:
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
@@ -1758,14 +1765,103 @@ class FeishuAdapter(BasePlatformAdapter):
         content: str,
         *,
         finalize: bool = False,
+        chat_type: Optional[str] = None,
+        append: bool = False,
     ) -> SendResult:
-        """Edit a previously sent Feishu text/post message."""
+        """Edit a previously sent Feishu text/post message.
+
+        When ``append`` is True, the new ``content`` is appended to the
+        existing message body instead of replacing it.  Currently only
+        supported for ``interactive`` (card) messages.
+        """
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
         content = self.format_message(content)
         try:
-            msg_type, payload = self._build_outbound_payload(content)
+            if append:
+                # Fetch raw message to detect interactive cards.
+                # For interactive cards we inject a note element and use
+                # delete+resend since Feishu message.update rejects
+                # interactive msg_type (230001/230054).
+                raw_msg_type, raw_content = await self._fetch_message_raw(message_id)
+                if raw_msg_type == "interactive" and raw_content:
+                    try:
+                        card = json.loads(raw_content)
+                        elements = card.setdefault("elements", [])
+                        elements.append({"tag": "hr"})
+                        elements.append({
+                            "tag": "note",
+                            "elements": [{"tag": "plain_text", "content": content}],
+                        })
+                        # Delete old card, then resend with footer injected.
+                        try:
+                            await asyncio.to_thread(
+                                self._client.im.v1.message.delete,
+                                self._build_delete_message_request(message_id),
+                            )
+                        except Exception as del_err:
+                            logger.debug("[Feishu] append_footer delete old message failed (non-fatal): %s", del_err)
+                        # Send new card with footer embedded.
+                        try:
+                            new_response = await self._feishu_send_with_retry(
+                                chat_id=chat_id,
+                                msg_type="interactive",
+                                payload=json.dumps(card, ensure_ascii=False),
+                                reply_to=None,
+                                metadata={},
+                            )
+                            result = self._finalize_send_result(new_response, "append_footer resend failed")
+                            if result.success and result.message_id:
+                                # Update stream_consumer's message_id via result.
+                                pass
+                            return result
+                        except Exception as send_err:
+                            logger.error("[Feishu] append_footer resend failed: %s", send_err)
+                            return SendResult(success=False, error=str(send_err))
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        logger.warning(
+                            "[Feishu] append_footer card JSON parse failed; falling back to text"
+                        )
+                        existing_text = self._extract_text_from_raw_content(
+                            msg_type=raw_msg_type, raw_content=raw_content,
+                        ) or ""
+                        combined = f"{existing_text}\n{content}" if existing_text else content
+                        _payload = json.dumps({"text": combined}, ensure_ascii=False)
+                        body = self._build_update_message_body(msg_type="text", content=_payload)
+                        request = self._build_update_message_request(message_id=message_id, request_body=body)
+                        response = await asyncio.to_thread(self._client.im.v1.message.update, request)
+                        result = self._finalize_send_result(response, "append_footer text update failed")
+                        if result.success:
+                            result.message_id = message_id
+                        return result
+                else:
+                    # Non-interactive message (text/post) — combine with existing text.
+                    existing_text = await self._fetch_message_text(message_id)
+                    if existing_text is not None:
+                        combined = f"{existing_text}\n{content}"
+                    else:
+                        combined = content  # fetch failed, fall back to replace
+                    msg_type, payload = "text", json.dumps({"text": combined}, ensure_ascii=False)
+                # Non-interactive append: use normal update path.
+                body = self._build_update_message_body(msg_type=msg_type, content=payload)
+                request = self._build_update_message_request(message_id=message_id, request_body=body)
+                response = await asyncio.to_thread(self._client.im.v1.message.update, request)
+                result = self._finalize_send_result(response, "update failed")
+                if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
+                    logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
+                    fallback_body = self._build_update_message_body(
+                        msg_type="text",
+                        content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
+                    )
+                    fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
+                    fallback_response = await asyncio.to_thread(self._client.im.v1.message.update, fallback_request)
+                    result = self._finalize_send_result(fallback_response, "update failed")
+                if result.success:
+                    result.message_id = message_id
+                return result
+            else:
+                msg_type, payload = self._build_outbound_payload(content, chat_type=chat_type)
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=body)
             response = await asyncio.to_thread(self._client.im.v1.message.update, request)
@@ -3686,6 +3782,33 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] Failed to fetch parent message %s", message_id, exc_info=True)
             return None
 
+    async def _fetch_message_raw(self, message_id: str) -> tuple[Optional[str], Optional[str]]:
+        """Fetch raw (msg_type, raw_content) from a previously sent message.
+
+        Returns (None, None) on failure. Used by append_footer path to detect
+        interactive cards so we can inject a note element instead of switching
+        the msg_type to text (which fails with Feishu error 230054).
+        """
+        if not self._client or not message_id:
+            return None, None
+        try:
+            request = self._build_get_message_request(message_id)
+            response = await asyncio.to_thread(self._client.im.v1.message.get, request)
+            if not response or getattr(response, "success", lambda: False)() is False:
+                code = getattr(response, "code", "unknown")
+                msg = getattr(response, "msg", "message lookup failed")
+                logger.warning("[Feishu] Failed to fetch message %s for raw access: [%s] %s", message_id, code, msg)
+                return None, None
+            items = getattr(getattr(response, "data", None), "items", None) or []
+            parent = items[0] if items else None
+            body = getattr(parent, "body", None)
+            msg_type = getattr(parent, "msg_type", "") or ""
+            raw_content = getattr(body, "content", "") or ""
+            return msg_type, raw_content
+        except Exception:
+            logger.warning("[Feishu] Failed to fetch raw message %s", message_id, exc_info=True)
+            return None, None
+
     def _extract_text_from_raw_content(
         self,
         *,
@@ -4004,17 +4127,32 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound payload construction and send pipeline
     # =========================================================================
 
-    def _build_outbound_payload(self, content: str) -> tuple[str, str]:
-        # Feishu post-type 'md' elements do not render markdown tables; sending
-        # table content as post causes the message to appear blank on the client.
-        # Force plain text for anything that looks like a markdown table.
-        if _MARKDOWN_TABLE_RE.search(content):
-            text_payload = {"text": content}
-            return "text", json.dumps(text_payload, ensure_ascii=False)
-        if _MARKDOWN_HINT_RE.search(content):
-            return "post", _build_markdown_post_payload(content)
-        text_payload = {"text": content}
-        return "text", json.dumps(text_payload, ensure_ascii=False)
+    def _build_outbound_payload(self, content: str, *, chat_type: Optional[str] = None) -> tuple[str, str]:
+        # If content is already an interactive card JSON, pass it through
+        # directly to avoid double-wrapping (e.g. footer-injected cards).
+        content_stripped = content.strip()
+        if content_stripped.startswith("{") and content_stripped.endswith("}"):
+            try:
+                parsed = json.loads(content_stripped)
+                if (isinstance(parsed, dict)
+                        and "config" in parsed
+                        and "header" in parsed
+                        and "elements" in parsed):
+                    return "interactive", content_stripped
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Wrap all outbound text in a minimal Feishu interactive card.
+        # This makes every message (DM reply, group message, etc.) a card.
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": "🤖 Hermes Agent", "tag": "plain_text"},
+                "template": "blue",
+            },
+            "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": content}}],
+        }
+        return "interactive", json.dumps(card, ensure_ascii=False)
 
     async def _send_uploaded_file_message(
         self,
@@ -4401,6 +4539,17 @@ class FeishuAdapter(BasePlatformAdapter):
                 .build()
             )
         return SimpleNamespace(message_id=message_id, request_body=request_body)
+
+    @staticmethod
+    def _build_delete_message_request(message_id: str) -> Any:
+        """Build a delete-message request for Feishu im.v1.message.delete."""
+        if "DeleteMessageRequest" in globals():
+            return (
+                DeleteMessageRequest.builder()
+                .message_id(message_id)
+                .build()
+            )
+        return SimpleNamespace(message_id=message_id)
 
     @staticmethod
     def _build_create_message_body(*, receive_id: str, msg_type: str, content: str, uuid_value: str) -> Any:

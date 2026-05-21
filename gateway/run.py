@@ -6107,6 +6107,8 @@ class GatewayRunner:
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
+        _stream_consumer = None  # initialized here so trailing footer edit (outer scope) can reference it
+        self._stream_consumer_holder = [None]  # shared between inner coroutine and trailing footer
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         logger.info(
@@ -6678,6 +6680,27 @@ class GatewayRunner:
         )
 
         try:
+            # For Feishu DMs: inject FEISHU_REPLY_TO_MESSAGE_ID so terminal
+            # subprocesses (e.g. send_card.py) can reply to the user's message
+            # without needing to know the message_id ahead of time.
+            if (
+                source.platform.value == "feishu"
+                and source.chat_type == "dm"
+                and event.message_id
+            ):
+                try:
+                    from tools.env_passthrough import register_env_passthrough
+                    register_env_passthrough([
+                        "FEISHU_REPLY_TO_MESSAGE_ID",
+                        "HERMES_FOOTER_MODEL",
+                        "HERMES_FOOTER_ELAPSED",
+                        "HERMES_FOOTER_STATUS",
+                        "HERMES_FOOTER_AGENT",
+                    ])
+                    os.environ["FEISHU_REPLY_TO_MESSAGE_ID"] = event.message_id
+                except Exception as _e:
+                    logger.debug("Failed to inject DM env vars: %s", _e)
+
             # Emit agent:start hook
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
@@ -6804,6 +6827,29 @@ class GatewayRunner:
             # streaming already delivered the body, we can't mutate the sent
             # text, so we fire a separate trailing send below.
             _footer_line = ""
+            _elapsed = None
+            _success = False
+            # Inject runtime metadata BEFORE build_footer_line() so the env vars
+            # are available when runtime_footer.py reads them.
+            try:
+                _model_short = (agent_result.get("model") or "").rsplit("/", 1)[-1]
+                _agent_name = "Hermes"
+                try:
+                    from hermes_cli.profiles import get_active_profile_name
+                    _agent_name = get_active_profile_name() or "Hermes"
+                except Exception:
+                    pass
+                # Profile alias: show friendly name instead of technical ID
+                _profile_aliases = {"default": "小锴"}
+                _agent_name = _profile_aliases.get(_agent_name, _agent_name)
+                _elapsed = time.time() - _msg_start_time if _msg_start_time else None
+                _success = bool(response and not agent_result.get("error"))
+                os.environ["HERMES_FOOTER_MODEL"] = _model_short
+                os.environ["HERMES_FOOTER_ELAPSED"] = f"{_elapsed:.2f}s" if _elapsed else ""
+                os.environ["HERMES_FOOTER_STATUS"] = "✅" if _success else "❌"
+                os.environ["HERMES_FOOTER_AGENT"] = _agent_name
+            except Exception:
+                pass
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
                 _footer_line = _bfl(
@@ -6813,12 +6859,71 @@ class GatewayRunner:
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
+                    elapsed_time=_elapsed,
+                    success=_success,
                 )
             except Exception as _footer_err:
-                logger.debug("runtime_footer build failed: %s", _footer_err)
+                logger.info("runtime_footer BUILD FAILED: %s", _footer_err)
                 _footer_line = ""
-            if _footer_line and response and not agent_result.get("already_sent"):
-                response = f"{response}\n\n{_footer_line}"
+            logger.info("runtime_footer: _footer_line=%r elapsed=%.2fs success=%s model=%s agent=%s", _footer_line, _elapsed or 0, _success, agent_result.get("model") or "", _agent_name)
+
+            if _footer_line and response:
+                # Plan A (2026-05-21): For interactive cards, inject footer directly
+                # into elements[] instead of relying on streaming edit_message which
+                # fails with Feishu error 230054 (interactive cards can't be edited).
+                _is_card, _card_data = False, None
+                try:
+                    _card_data = json.loads(response) if isinstance(response, str) else response
+                    # Only match actual Feishu interactive cards (skill scripts output),
+                    # not the adapter-wrapped text. Key fields: config+header+elements.
+                    if (isinstance(_card_data, dict)
+                            and "config" in _card_data
+                            and "header" in _card_data
+                            and "elements" in _card_data):
+                        _is_card = True
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+                if _is_card and _card_data:
+                    _elements = _card_data.setdefault("elements", [])
+                    _elements.append({"tag": "hr"})
+                    _elements.append({
+                        "tag": "note",
+                        "elements": [{"tag": "plain_text", "content": _footer_line}],
+                    })
+                    response = json.dumps(_card_data, ensure_ascii=False)
+
+                    # Streaming path: the card was already sent by stream consumer
+                    # without footer. Delete the old card and resend the complete one.
+                    if agent_result.get("already_sent"):
+                        _sc = self._stream_consumer_holder[0]
+                        _old_msg_id = getattr(_sc, "_message_id", None) if _sc else None
+                        if _sc and hasattr(_sc, "adapter") and _old_msg_id:
+                            try:
+                                await _sc.adapter.delete_message(_sc.chat_id, _old_msg_id)
+                            except Exception as _del_err:
+                                logger.debug("Footer card delete-old failed: %s", _del_err)
+                            try:
+                                await _sc.adapter.send(
+                                    chat_id=_sc.chat_id,
+                                    content=response,
+                                    metadata=getattr(_sc, "metadata", None),
+                                )
+                            except Exception as _resend_err:
+                                logger.warning("Footer card resend failed: %s", _resend_err)
+                    # Mark appended so the plain-text fallback below is skipped.
+                    _footer_appended = True
+                else:
+                    # Original logic for non-card responses (text/post).
+                    _sc = self._stream_consumer_holder[0]
+                    _footer_appended = False
+                    if _sc and hasattr(_sc, "append_footer"):
+                        _footer_appended = await _sc.append_footer(_footer_line)
+                    if not _footer_appended:
+                        # Fallback: append footer as plain text to the response.
+                        # Only reached when streaming is off, no stream consumer,
+                        # or edit_message failed (no message_id).
+                        response = f"{response}\n\n{_footer_line}"
 
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
@@ -7029,21 +7134,8 @@ class GatewayRunner:
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
-                # Streaming already delivered the body text, but the footer was
-                # intentionally held back (see the `not already_sent` gate above).
-                # Send it now as a small trailing message so Telegram/Discord/etc.
-                # still surface the runtime metadata on the final reply.
-                if _footer_line:
-                    try:
-                        _foot_adapter = self.adapters.get(source.platform)
-                        if _foot_adapter:
-                            await _foot_adapter.send(source.chat_id, _footer_line)
-                    except Exception as _e:
-                        logger.debug("trailing footer send failed: %s", _e)
-                return None
 
-            return response
-            
+            # Footer is sent inline as part of the streamed content.
         except Exception as e:
             # Stop typing indicator on error too
             try:
@@ -12824,6 +12916,11 @@ class GatewayRunner:
         else:
             _thread_metadata = None
 
+        # Inject chat_type into metadata for DM vs group routing
+        if _thread_metadata is None:
+            _thread_metadata = {}
+        _thread_metadata["chat_type"] = source.chat_type
+
         if _streaming_enabled:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
@@ -13476,6 +13573,7 @@ class GatewayRunner:
         result_holder = [None]  # Mutable container for the result
         tools_holder = [None]   # Mutable container for the tool definitions
         stream_consumer_holder = [None]  # Mutable container for stream consumer
+        self._stream_consumer_holder = stream_consumer_holder  # share with outer scope for trailing footer
         
         # Bridge sync step_callback → async hooks.emit for agent:step events
         _loop_for_step = asyncio.get_running_loop()
@@ -14721,7 +14819,7 @@ class GatewayRunner:
                     # Queued message after normal completion — deliver the first
                     # response before processing the queued follow-up.
                     # Skip if streaming already delivered it.
-                    _sc = stream_consumer_holder[0]
+                    _sc = self._stream_consumer_holder[0]
                     if _sc and stream_task:
                         try:
                             await asyncio.wait_for(stream_task, timeout=5.0)

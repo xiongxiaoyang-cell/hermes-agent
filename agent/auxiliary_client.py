@@ -2064,7 +2064,7 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
             api_mode=runtime_api_mode or None,
         )
         if client is not None:
-            logger.info("Auxiliary auto-detect: using main provider %s (%s)",
+            logger.debug("Auxiliary auto-detect: using main provider %s (%s)",
                         main_provider, resolved or main_model)
             return client, resolved or main_model
 
@@ -2074,10 +2074,10 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
         client, model = try_fn()
         if client is not None:
             if tried:
-                logger.info("Auxiliary auto-detect: using %s (%s) — skipped: %s",
+                logger.debug("Auxiliary auto-detect: using %s (%s) — skipped: %s",
                             label, model or "default", ", ".join(tried))
             else:
-                logger.info("Auxiliary auto-detect: using %s (%s)", label, model or "default")
+                logger.debug("Auxiliary auto-detect: using %s (%s)", label, model or "default")
             return client, model
         tried.append(label)
     logger.warning("Auxiliary auto-detect: no provider available (tried: %s). "
@@ -2850,7 +2850,7 @@ def resolve_vision_provider_client(
                     main_provider, vision_model
                 )
                 if sync_client is not None:
-                    logger.info(
+                    logger.debug(
                         "Vision auto-detect: using main provider %s (%s)",
                         main_provider, default_model or resolved_model or main_model,
                     )
@@ -2874,7 +2874,7 @@ def resolve_vision_provider_client(
                     api_mode=resolved_api_mode,
                     is_vision=True)
                 if rpc_client is not None:
-                    logger.info(
+                    logger.debug(
                         "Vision auto-detect: using main provider %s (%s)",
                         main_provider, rpc_model or vision_model,
                     )

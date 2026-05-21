@@ -41,8 +41,8 @@ _COMMENTARY = object()
 class StreamConsumerConfig:
     """Runtime config for a single stream consumer instance."""
     edit_interval: float = 1.0
-    buffer_threshold: int = 40
-    cursor: str = " ▉"
+    buffer_threshold: int = 2000
+    cursor: str = ""
     buffer_only: bool = False
     # When >0, the final edit for a streamed response is delivered as a
     # fresh message if the original preview has been visible for at least
@@ -131,6 +131,10 @@ class GatewayStreamConsumer:
         self._adapter_requires_finalize: bool = (
             getattr(adapter, "REQUIRES_EDIT_FINALIZE", False) is True
         )
+        # Persisted after finish() so the trailing footer in gateway/run.py
+        # can still edit the card even after _message_id is reset by
+        # _reset_segment_state(preserve_no_edit=True) on stream completion.
+        self._last_msg_id: Optional[str] = None
 
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
@@ -199,13 +203,19 @@ class GatewayStreamConsumer:
     # response (run_agent.py _strip_think_blocks), but the stream
     # consumer sends intermediate edits before that stripping happens.
 
-    def _filter_and_accumulate(self, text: str) -> None:
-        """Add a text delta to the accumulated buffer, suppressing think blocks.
+    # ===========================================================================
+    # CardKit Thinking Stream — typewriter effect for reasoning/thinking blocks
+    # ===========================================================================
+    # Think-block filter (state machine — mirrors CLI's _stream_delta)
+    # ===========================================================================
+
+    async def _filter_and_accumulate(self, text: str) -> None:
+        """Add a text delta to the accumulated buffer, streaming think blocks via CardKit.
 
         Uses a state machine that tracks whether we are inside a
-        reasoning/thinking block.  Text inside such blocks is silently
-        discarded.  Partial tags at buffer boundaries are held back in
-        ``_think_buffer`` until enough characters arrive to decide.
+        reasoning/thinking block.  Text inside such blocks is streamed
+        to a CardKit thinking card for typewriter effect instead of
+        being discarded.
         """
         buf = self._think_buffer + text
         self._think_buffer = ""
@@ -222,12 +232,11 @@ class GatewayStreamConsumer:
                         best_len = len(tag)
 
                 if best_len:
-                    # Found closing tag — discard block, process remainder
+                    # Found closing tag — close thinking card, process remainder
                     self._in_think_block = False
                     buf = buf[best_idx + best_len:]
                 else:
-                    # No closing tag yet — hold tail that could be a
-                    # partial closing tag prefix, discard the rest.
+                    # No closing tag yet — hold back any partial closing-tag prefix
                     max_tag = max(len(t) for t in self._CLOSE_THINK_TAGS)
                     self._think_buffer = buf[-max_tag:] if len(buf) > max_tag else buf
                     return
@@ -287,11 +296,11 @@ class GatewayStreamConsumer:
                         self._accumulated += buf
                     return
 
-    def _flush_think_buffer(self) -> None:
+    async def _flush_think_buffer(self) -> None:
         """Flush any held-back partial-tag buffer into accumulated text.
 
         Called when the stream ends (got_done) so that partial text that
-        was held back waiting for a possible opening tag is not lost.
+        was held back waiting for a potential open tag is not lost.
         """
         if self._think_buffer and not self._in_think_block:
             self._accumulated += self._think_buffer
@@ -321,7 +330,7 @@ class GatewayStreamConsumer:
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
                             commentary_text = item[1]
                             break
-                        self._filter_and_accumulate(item)
+                        await self._filter_and_accumulate(item)
                     except queue.Empty:
                         break
 
@@ -329,7 +338,7 @@ class GatewayStreamConsumer:
                 # so trailing text that was waiting for a potential open
                 # tag is not lost.
                 if got_done:
-                    self._flush_think_buffer()
+                    await self._flush_think_buffer()
 
                 # Decide whether to flush an edit
                 now = time.monotonic()
@@ -379,13 +388,25 @@ class GatewayStreamConsumer:
                     # Existing message: edit it with the first chunk, then
                     # start a new message for the overflow remainder.
                     while (
-                        len(self._accumulated) > _safe_limit
+                        len(self._accumulated.encode("utf-8")) > _safe_limit
                         and self._message_id is not None
                         and self._edit_supported
                     ):
-                        split_at = self._accumulated.rfind("\n", 0, _safe_limit)
-                        if split_at < _safe_limit // 2:
-                            split_at = _safe_limit
+                        # Split by UTF-8 byte boundary, not Unicode code point.
+                        # This prevents multi-byte characters (e.g. Chinese, emoji)
+                        # from being truncated mid-byte when Feishu enforces
+                        # MAX_MESSAGE_LENGTH as a UTF-8 byte limit.
+                        byte_limit = _safe_limit
+                        chunk_bytes = self._accumulated.encode("utf-8")[:byte_limit]
+                        # Backtrack to last newline or space for clean split
+                        split_at = self._accumulated.rfind("\n", 0, len(chunk_bytes))
+                        if split_at < byte_limit // 2:
+                            # No clean break; find last space before byte limit
+                            split_at = self._accumulated.rfind(" ", 0, len(chunk_bytes))
+                        if split_at < byte_limit // 2:
+                            # No space either; split exactly at byte boundary
+                            # (decode partial UTF-8 safely by truncating to codepoint)
+                            split_at = len(chunk_bytes.decode("utf-8", errors="replace"))
                         chunk = self._accumulated[:split_at]
                         ok = await self._send_or_edit(chunk)
                         if self._fallback_final_send or not ok:
@@ -395,7 +416,7 @@ class GatewayStreamConsumer:
                             # fallback final-send path can deliver the remaining
                             # continuation without dropping content.
                             break
-                        self._accumulated = self._accumulated[split_at:].lstrip("\n")
+                        self._accumulated = self._accumulated[len(chunk):].lstrip("\n")
                         self._message_id = None
                         self._last_sent_text = ""
 
@@ -538,14 +559,17 @@ class GatewayStreamConsumer:
             return reply_to_id
         try:
             meta = dict(self.metadata) if self.metadata else {}
+            _chat_type = meta.pop("chat_type", None) if meta else None
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
                 reply_to=reply_to_id,
                 metadata=meta,
+                chat_type=_chat_type,
             )
             if result.success and result.message_id:
                 self._message_id = str(result.message_id)
+                self._last_msg_id = str(result.message_id)  # survive finish() reset
                 self._already_sent = True
                 self._last_sent_text = text
                 # Fresh content bubble — close off any stale tool bubble
@@ -580,12 +604,24 @@ class GatewayStreamConsumer:
             return [text]
         chunks: list[str] = []
         remaining = text
-        while len(remaining) > limit:
-            split_at = remaining.rfind("\n", 0, limit)
-            if split_at < limit // 2:
-                split_at = limit
-            chunks.append(remaining[:split_at])
-            remaining = remaining[split_at:].lstrip("\n")
+        while len(remaining.encode("utf-8")) > limit:
+            # Find safe UTF-8 byte boundary <= limit, then backtrack
+            _byte_limit = limit
+            while _byte_limit > 0:
+                try:
+                    chunk_bytes = remaining.encode("utf-8")[:_byte_limit]
+                    chunk_candidate = chunk_bytes.decode("utf-8")
+                    break
+                except UnicodeDecodeError:
+                    _byte_limit -= 1
+            _search_from = len(chunk_candidate)
+            split_at = chunk_candidate.rfind("\n", 0, _search_from)
+            if split_at < _search_from // 2:
+                split_at = chunk_candidate.rfind(" ", 0, _search_from)
+            if split_at < _search_from // 2:
+                split_at = _search_from
+            chunks.append(chunk_candidate[:split_at])
+            remaining = remaining[len(chunk_candidate[:split_at]):].lstrip("\n")
         if remaining:
             chunks.append(remaining)
         return chunks
@@ -623,10 +659,13 @@ class GatewayStreamConsumer:
                 ):
                     clean_text = self._last_sent_text[:-len(self.cfg.cursor)]
                     try:
+                        meta = dict(self.metadata) if self.metadata else {}
+                        _chat_type = meta.pop("chat_type", None) if meta else None
                         result = await self.adapter.edit_message(
                             chat_id=self.chat_id,
                             message_id=self._message_id,
                             content=clean_text,
+                            chat_type=_chat_type,
                         )
                         if result.success:
                             self._last_sent_text = clean_text
@@ -647,10 +686,13 @@ class GatewayStreamConsumer:
             # Try sending with one retry on flood-control errors.
             result = None
             for attempt in range(2):
+                meta = dict(self.metadata) if self.metadata else {}
+                _chat_type = meta.pop("chat_type", None) if meta else None
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=chunk,
-                    metadata=self.metadata,
+                    metadata=meta,
+                    chat_type=_chat_type,
                 )
                 if result.success:
                     break
@@ -722,10 +764,13 @@ class GatewayStreamConsumer:
         if not tail.strip():
             return
         try:
+            meta = dict(self.metadata) if self.metadata else {}
+            _chat_type = meta.pop("chat_type", None) if meta else None
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=tail,
-                metadata=self.metadata,
+                metadata=meta,
+                chat_type=_chat_type,
             )
             if result.success:
                 self._already_sent = True
@@ -744,10 +789,13 @@ class GatewayStreamConsumer:
         if not prefix or not prefix.strip():
             return
         try:
+            meta = dict(self.metadata) if self.metadata else {}
+            _chat_type = meta.pop("chat_type", None) if meta else None
             await self.adapter.edit_message(
                 chat_id=self.chat_id,
                 message_id=self._message_id,
                 content=prefix,
+                chat_type=_chat_type,
             )
             self._last_sent_text = prefix
         except Exception:
@@ -857,17 +905,14 @@ class GatewayStreamConsumer:
     async def _send_or_edit(self, text: str, *, finalize: bool = False) -> bool:
         """Send or edit the streaming message.
 
-        Returns True if the text was successfully delivered (sent or edited),
-        False otherwise.  Callers like the overflow split loop use this to
-        decide whether to advance past the delivered chunk.
-
-        ``finalize`` is True when this is the last edit in a streaming
-        sequence.
+        Plain-text / edit path: first send → subsequent deltas edit in place.
         """
         # Strip MEDIA: directives so they don't appear as visible text.
         # Media files are delivered as native attachments after the stream
         # finishes (via _deliver_media_from_response in gateway/run.py).
         text = self._clean_for_display(text)
+        # Strip leading/trailing newlines to prevent blank lines in card rendering
+        text = text.lstrip("\n").rstrip()
         # A bare streaming cursor is not meaningful user-visible content and
         # can render as a stray tofu/white-box message on some clients.
         visible_without_cursor = text
@@ -894,28 +939,15 @@ class GatewayStreamConsumer:
                 and len(_visible_stripped) < _MIN_NEW_MSG_CHARS):
             return True  # too short for a standalone message — accumulate more
         try:
+            # Default / fallback path (regular IM API edit)
             if self._message_id is not None:
                 if self._edit_supported:
                     # Skip if text is identical to what we last sent.
-                    # Exception: adapters that require an explicit finalize
-                    # call (REQUIRES_EDIT_FINALIZE) must still receive the
-                    # finalize=True edit even when content is unchanged, so
-                    # their streaming UI can transition out of the in-
-                    # progress state.  Everyone else short-circuits.
                     if text == self._last_sent_text and not (
                         finalize and self._adapter_requires_finalize
                     ):
                         return True
-                    # Fresh-final for long-lived previews: when finalizing
-                    # the last edit in a streaming sequence, if the
-                    # original preview has been visible for at least
-                    # ``fresh_final_after_seconds``, send the completed
-                    # reply as a fresh message so the platform's visible
-                    # timestamp reflects completion time instead of the
-                    # preview creation time.  Best-effort cleanup of the
-                    # old preview follows.  Ported from
-                    # openclaw/openclaw#72038.  Gated by config so the
-                    # legacy edit-in-place path stays the default.
+                    # Fresh-final for long-lived previews
                     if (
                         finalize
                         and self._should_send_fresh_final()
@@ -923,23 +955,22 @@ class GatewayStreamConsumer:
                     ):
                         return True
                     # Edit existing message
+                    meta = dict(self.metadata) if self.metadata else {}
+                    _chat_type = meta.pop("chat_type", None) if meta else None
                     result = await self.adapter.edit_message(
                         chat_id=self.chat_id,
                         message_id=self._message_id,
                         content=text,
                         finalize=finalize,
+                        chat_type=_chat_type,
                     )
                     if result.success:
                         self._already_sent = True
                         self._last_sent_text = text
-                        # Successful edit — reset flood strike counter
+                        self._last_msg_id = self._message_id  # survive finish() reset
                         self._flood_strikes = 0
                         return True
                     else:
-                        # Edit failed.  If this looks like flood control / rate
-                        # limiting, use adaptive backoff: double the edit interval
-                        # and retry on the next cycle.  Only permanently disable
-                        # edits after _MAX_FLOOD_STRIKES consecutive failures.
                         if self._is_flood_error(result):
                             self._flood_strikes += 1
                             self._current_edit_interval = min(
@@ -953,15 +984,8 @@ class GatewayStreamConsumer:
                                 self._current_edit_interval,
                             )
                             if self._flood_strikes < self._MAX_FLOOD_STRIKES:
-                                # Don't disable edits yet — just slow down.
-                                # Update _last_edit_time so the next edit
-                                # respects the new interval.
                                 self._last_edit_time = time.monotonic()
                                 return False
-
-                        # Non-flood error OR flood strikes exhausted: enter
-                        # fallback mode — send only the missing tail once the
-                        # final response is available.
                         logger.debug(
                             "Edit failed (strikes=%d), entering fallback mode",
                             self._flood_strikes,
@@ -970,27 +994,23 @@ class GatewayStreamConsumer:
                         self._fallback_final_send = True
                         self._edit_supported = False
                         self._already_sent = True
-                        # Best-effort: strip the cursor from the last visible
-                        # message so the user doesn't see a stuck ▉.
                         await self._try_strip_cursor()
                         return False
                 else:
-                    # Editing not supported — skip intermediate updates.
-                    # The final response will be sent by the fallback path.
                     return False
             else:
                 # First message — send new
+                meta = dict(self.metadata) if self.metadata else {}
+                _chat_type = meta.pop("chat_type", None) if meta else None
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=text,
-                    metadata=self.metadata,
+                    metadata=meta,
+                    chat_type=_chat_type,
                 )
                 if result.success:
                     if result.message_id:
                         self._message_id = result.message_id
-                        # Track when the preview first became visible to
-                        # the user so fresh-final logic can detect stale
-                        # preview timestamps on long-running responses.
                         self._message_created_ts = time.monotonic()
                     else:
                         self._edit_supported = False
@@ -999,20 +1019,66 @@ class GatewayStreamConsumer:
                     if not result.message_id:
                         self._fallback_prefix = self._visible_prefix()
                         self._fallback_final_send = True
-                        # Sentinel prevents re-entering the first-send path on
-                        # every delta/tool boundary when platforms accept a
-                        # message but do not return an editable message id.
                         self._message_id = "__no_edit__"
-                    # Notify the gateway that a fresh content bubble was
-                    # created so any accumulated tool-progress bubble above
-                    # gets closed off — the next tool fires into a new
-                    # bubble below, preserving chronological order.
                     self._notify_new_message()
                     return True
                 else:
-                    # Initial send failed — disable streaming for this session
                     self._edit_supported = False
                     return False
         except Exception as e:
             logger.error("Stream send/edit error: %s", e)
+            return False
+
+    async def append_footer(self, footer_line: str) -> bool:
+        """Append footer to the already-sent message via edit_message.
+
+        Uses _last_sent_text as the base so we always have the full message
+        content to combine, regardless of whether the platform's edit_message
+        does an in-place append or a full replace.
+        """
+        if not footer_line or not self._already_sent:
+            return False
+        if not self._message_id:
+            # No message_id means edit_message can't work — let the caller fall
+            # back to appending footer as plain text to the response string.
+            return False
+        try:
+            _chat_type = None
+            if self.metadata:
+                _chat_type = self.metadata.get("chat_type")
+            # Pass just the footer_line. For interactive cards, edit_message
+            # will embed it as a note element. For text/post, edit_message
+            # will fetch existing text and combine with the footer.
+            result = await self.adapter.edit_message(
+                chat_id=self.chat_id,
+                message_id=self._message_id,
+                content=footer_line,
+                finalize=True,
+                chat_type=_chat_type,
+                append=True,  # Feishu will fetch+combine or inject note
+            )
+            if result.success:
+                self._last_sent_text = f"{getattr(self, '_last_sent_text', '')}\n\n{footer_line}"
+                return True
+            else:
+                logger.warning("append_footer edit_message failed: %s", result)
+                # Fallback: send footer as a separate tiny message.
+                # Needed for platforms where the original message is an
+                # interactive card that can't be edited (e.g. Feishu 230054).
+                try:
+                    fallback_result = await self.adapter.send(
+                        chat_id=self.chat_id,
+                        content=footer_line,
+                        metadata=self.metadata,
+                        chat_type=_chat_type,
+                    )
+                    if fallback_result.success:
+                        logger.info("append_footer fallback send succeeded")
+                        return True
+                    logger.warning("append_footer fallback send failed: %s", fallback_result)
+                except Exception as send_err:
+                    logger.error("append_footer fallback send error: %s", send_err)
+                return False
+        except Exception as e:
+            logger.error("append_footer error: %s", e)
             return False
