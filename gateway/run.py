@@ -553,7 +553,6 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
 )
-from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
@@ -1093,7 +1092,6 @@ class GatewayRunner:
             self.config.sessions_dir, self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(key),
         )
-        self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
@@ -1771,7 +1769,6 @@ class GatewayRunner:
                 await adapter.disconnect()
             finally:
                 self.adapters.pop(adapter.platform, None)
-                self.delivery_router.adapters = self.adapters
 
         # Queue retryable failures for background reconnection
         if adapter.fatal_error_retryable:
@@ -3249,9 +3246,6 @@ class GatewayRunner:
             logger.warning("No messaging platforms enabled.")
             logger.info("Gateway will continue running for cron job execution.")
         
-        # Update delivery router with adapters
-        self.delivery_router.adapters = self.adapters
-        
         self._running = True
         self._update_runtime_status("running")
         
@@ -4061,7 +4055,6 @@ class GatewayRunner:
                     if success:
                         self.adapters[platform] = adapter
                         self._sync_voice_mode_state_to_adapter(adapter)
-                        self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
                         self._update_platform_runtime_status(
                             platform.value,
@@ -6898,21 +6891,29 @@ class GatewayRunner:
                     if agent_result.get("already_sent"):
                         _sc = self._stream_consumer_holder[0]
                         _old_msg_id = getattr(_sc, "_message_id", None) if _sc else None
+                        _footer_resent = False
                         if _sc and hasattr(_sc, "adapter") and _old_msg_id:
                             try:
-                                await _sc.adapter.delete_message(_sc.chat_id, _old_msg_id)
-                            except Exception as _del_err:
-                                logger.debug("Footer card delete-old failed: %s", _del_err)
-                            try:
-                                await _sc.adapter.send(
-                                    chat_id=_sc.chat_id,
-                                    content=response,
-                                    metadata=getattr(_sc, "metadata", None),
+                                await self._stream_consumer_holder[0].adapter.delete_message(
+                                    self._stream_consumer_holder[0].chat_id, _old_msg_id
                                 )
+                            except Exception as _del_err:
+                                logger.warning("Footer card delete failed (msg_id=%s): %s", _old_msg_id, _del_err)
+                            try:
+                                await self._stream_consumer_holder[0].adapter.send(
+                                    chat_id=self._stream_consumer_holder[0].chat_id,
+                                    content=response,
+                                    metadata=getattr(self._stream_consumer_holder[0], "metadata", None),
+                                )
+                                _footer_resent = True
                             except Exception as _resend_err:
-                                logger.warning("Footer card resend failed: %s", _resend_err)
-                    # Mark appended so the plain-text fallback below is skipped.
-                    _footer_appended = True
+                                logger.error("Footer card resend FAILED (session=%s): %s", session_key, _resend_err)
+                        # Only mark footer appended if resend succeeded; otherwise
+                        # let the fallback below append footer as plain text.
+                        if _footer_resent:
+                            _footer_appended = True
+                        else:
+                            _footer_appended = False
                 else:
                     # Original logic for non-card responses (text/post).
                     _sc = self._stream_consumer_holder[0]
@@ -12850,11 +12851,6 @@ class GatewayRunner:
 
         proxy_key = os.getenv("GATEWAY_PROXY_KEY", "").strip()
 
-        def _run_still_current() -> bool:
-            if run_generation is None or not session_key:
-                return True
-            return self._is_session_run_current(session_key, run_generation)
-
         # Build messages in OpenAI chat format --------------------------
         #
         # The remote api_server can maintain session continuity via
@@ -12998,7 +12994,7 @@ class GatewayRunner:
                     # Parse SSE stream
                     buffer = ""
                     async for chunk in resp.content.iter_any():
-                        if not _run_still_current():
+                        if not self._is_session_run_current(session_key, run_generation):
                             logger.info(
                                 "Discarding stale proxy stream for %s — generation %d is no longer current",
                                 session_key or "?",
@@ -13062,7 +13058,7 @@ class GatewayRunner:
                     stream_task.cancel()
 
         _elapsed = time.time() - _start
-        if not _run_still_current():
+        if not self._is_session_run_current(session_key, run_generation):
             logger.info(
                 "Discarding stale proxy result for %s — generation %d is no longer current",
                 session_key or "?",
@@ -13092,7 +13088,7 @@ class GatewayRunner:
             "tools": [],
             "history_offset": len(history),
             "session_id": session_id,
-            "response_previewed": _stream_consumer is not None and bool(full_response),
+            "response_previewed": _stream_consumer is not None,
         }
 
     # ------------------------------------------------------------------
@@ -13138,11 +13134,6 @@ class GatewayRunner:
         from run_agent import AIAgent
         import queue
 
-        def _run_still_current() -> bool:
-            if run_generation is None or not session_key:
-                return True
-            return self._is_session_run_current(session_key, run_generation)
-        
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
 
@@ -13236,7 +13227,7 @@ class GatewayRunner:
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
-            if not progress_queue or not _run_still_current():
+            if not progress_queue or not self._is_session_run_current(session_key, run_generation):
                 return
 
             # First-touch onboarding: the first time a tool takes longer than
@@ -13392,7 +13383,7 @@ class GatewayRunner:
 
             while True:
                 try:
-                    if not _run_still_current():
+                    if not self._is_session_run_current(session_key, run_generation):
                         while not progress_queue.empty():
                             try:
                                 progress_queue.get_nowait()
@@ -13455,7 +13446,7 @@ class GatewayRunner:
                         await asyncio.sleep(_remaining)
                         continue
 
-                    if not _run_still_current():
+                    if not self._is_session_run_current(session_key, run_generation):
                         return
 
                     if can_edit and progress_msg_id is not None:
@@ -13516,7 +13507,7 @@ class GatewayRunner:
 
                     # Restore typing indicator
                     await asyncio.sleep(0.3)
-                    if _run_still_current():
+                    if self._is_session_run_current(session_key, run_generation):
                         await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
 
                 except queue.Empty:
@@ -13580,7 +13571,7 @@ class GatewayRunner:
         _hooks_ref = self.hooks
 
         def _step_callback_sync(iteration: int, prev_tools: list) -> None:
-            if not _run_still_current():
+            if not self._is_session_run_current(session_key, run_generation):
                 return
             try:
                 # prev_tools may be list[str] or list[dict] with "name"/"result"
@@ -13622,7 +13613,7 @@ class GatewayRunner:
             _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
 
         def _status_callback_sync(event_type: str, message: str) -> None:
-            if not _status_adapter or not _run_still_current():
+            if not _status_adapter or not self._is_session_run_current(session_key, run_generation):
                 return
             try:
                 _fut = asyncio.run_coroutine_threadsafe(
@@ -13778,14 +13769,14 @@ class GatewayRunner:
                         )
                         if _want_stream_deltas:
                             def _stream_delta_cb(text: str) -> None:
-                                if _run_still_current():
+                                if self._is_session_run_current(session_key, run_generation):
                                     _stream_consumer.on_delta(text)
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
-                if not _run_still_current():
+                if not self._is_session_run_current(session_key, run_generation):
                     return
                 if _stream_consumer is not None:
                     if already_streamed:
@@ -13892,7 +13883,7 @@ class GatewayRunner:
             _bg_review_pending_lock = threading.Lock()
 
             def _deliver_bg_review_message(message: str) -> None:
-                if not _status_adapter or not _run_still_current():
+                if not _status_adapter or not self._is_session_run_current(session_key, run_generation):
                     return
                 try:
                     asyncio.run_coroutine_threadsafe(
@@ -13916,7 +13907,7 @@ class GatewayRunner:
 
             # Background review delivery — send "💾 Memory updated" etc. to user
             def _bg_review_send(message: str) -> None:
-                if not _status_adapter or not _run_still_current():
+                if not _status_adapter or not self._is_session_run_current(session_key, run_generation):
                     return
                 if not _bg_review_release.is_set():
                     with _bg_review_pending_lock:
@@ -13981,10 +13972,12 @@ class GatewayRunner:
                     # Simple text message - just need role and content
                     content = msg.get("content")
                     if content:
-                        # Tag cross-platform mirror messages so the agent knows their origin
+                        # Skip mirror messages — they are delivery confirmations
+                        # from send_message/cron, not real user input. Feeding them
+                        # back to the agent creates a feedback loop (agent responds
+                        # to its own delivery confirmation → double send).
                         if msg.get("mirror"):
-                            mirror_src = msg.get("mirror_source", "another session")
-                            content = f"[Delivered from {mirror_src}] {content}"
+                            continue
                         entry = {"role": role, "content": content}
                         # Preserve reasoning fields on assistant messages so
                         # multi-turn reasoning context survives session reload.

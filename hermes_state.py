@@ -544,7 +544,11 @@ class SessionDB:
         self._execute_write(_do)
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
-        """Create a new session record. Returns the session_id."""
+        """Create a new session record. Returns the session_id.
+
+        Uses INSERT OR IGNORE so it is safe to call even if the session
+        already exists (idempotent).
+        """
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
     def end_session(self, session_id: str, end_reason: str) -> None:
@@ -684,8 +688,8 @@ class SessionDB:
         model: str = None,
         **kwargs,
     ) -> str:
-        """Ensure a session row exists (INSERT OR IGNORE). Accepts optional kwargs."""
-        self._insert_session_row(session_id, source, model=model, **kwargs)
+        """Ensure a session row exists. Alias for create_session (idempotent)."""
+        self.create_session(session_id, source, model=model, **kwargs)
         return session_id
 
     def prune_empty_ghost_sessions(self, sessions_dir: "Optional[Path]" = None) -> int:

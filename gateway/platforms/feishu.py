@@ -161,7 +161,6 @@ _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
 _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
-_POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -512,24 +511,6 @@ def _render_code_block_element(element: Dict[str, Any]) -> str:
     ).replace("\r\n", "\n")
     trailing_newline = "" if code.endswith("\n") else "\n"
     return f"```{language}\n{code}{trailing_newline}```"
-
-
-def _strip_markdown_to_plain_text(text: str) -> str:
-    """Strip markdown formatting to plain text for Feishu text fallbacks.
-
-    Delegates common markdown stripping to the shared helper and adds
-    Feishu-specific patterns (blockquotes, strikethrough, underline tags,
-    horizontal rules, \\r\\n normalisation).
-    """
-    from gateway.platforms.helpers import strip_markdown
-    plain = text.replace("\r\n", "\n")
-    plain = _MARKDOWN_LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2).strip()})", plain)
-    plain = re.sub(r"^>\s?", "", plain, flags=re.MULTILINE)
-    plain = re.sub(r"^\s*---+\s*$", "---", plain, flags=re.MULTILINE)
-    plain = re.sub(r"~~([^~\n]+)~~", r"\1", plain)
-    plain = re.sub(r"<u>([\s\S]*?)</u>", r"\1", plain)
-    plain = strip_markdown(plain)
-    return plain
 
 
 def _coerce_int(value: Any, default: Optional[int] = None, min_value: int = 0) -> Optional[int]:
@@ -1372,6 +1353,9 @@ class FeishuAdapter(BasePlatformAdapter):
         self._apply_settings(self._settings)
         self._client: Optional[Any] = None
         self._ws_client: Optional[Any] = None
+        # Last card JSON produced by _build_outbound_payload — used by send()
+        # to return card_json in SendResult for footer injection.
+        self._last_card_json: Optional[str] = None
         self._ws_future: Optional[asyncio.Future] = None
         self._ws_thread_loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -1398,6 +1382,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
         self._message_text_cache: Dict[str, Optional[str]] = {}
+        # Keep text cache bounded to avoid unbounded growth
+        _TEXT_CACHE_MAX_SIZE = 200
         self._app_lock_identity: Optional[str] = None
         self._text_batch_state = FeishuBatchState()
         self._pending_text_batches = self._text_batch_state.events
@@ -1696,8 +1682,26 @@ class FeishuAdapter(BasePlatformAdapter):
             self._webhook_site = None
 
     # =========================================================================
-    # Outbound — send / edit / send_image / send_voice / …
+    # Outbound — send / edit / delete_message / send_image / send_voice / …
     # =========================================================================
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a previously sent message via im.v1.message.delete."""
+        # chat_id is accepted for interface compatibility; Feishu API only
+        # requires message_id (chat context is implicit from the token).
+        if not self._client:
+            return False
+        try:
+            request = self._build_delete_message_request(message_id)
+            response = await asyncio.to_thread(self._client.im.v1.message.delete, request)
+            ok = response and getattr(response, "success", lambda: False)()
+            if not ok:
+                code = getattr(response, "code", "?")
+                logger.warning("[Feishu] delete_message failed [%s]", code)
+            return ok
+        except Exception as exc:
+            logger.warning("[Feishu] delete_message(%s, %s) raised: %s", chat_id, message_id, exc)
+            return False
 
     async def send(
         self,
@@ -1717,43 +1721,18 @@ class FeishuAdapter(BasePlatformAdapter):
         last_response = None
 
         try:
-            for chunk in chunks:
+            for idx, chunk in enumerate(chunks):
                 msg_type, payload = self._build_outbound_payload(chunk, chat_type=chat_type)
-                try:
-                    response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
-                        msg_type=msg_type,
-                        payload=payload,
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
-                except Exception as exc:
-                    if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
-                        raise
-                    logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
-                    response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
-                        msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
-                if (
-                    msg_type == "post"
-                    and not self._response_succeeded(response)
-                    and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
-                ):
-                    logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
-                    response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
-                        msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
+                response = await self._feishu_send_with_retry(
+                    chat_id=chat_id,
+                    msg_type=msg_type,
+                    payload=payload,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
                 last_response = response
 
-            return self._finalize_send_result(last_response, "send failed")
+            return self._finalize_send_result(last_response, "send failed", card_json=self._last_card_json)
         except Exception as exc:
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
@@ -1787,8 +1766,20 @@ class FeishuAdapter(BasePlatformAdapter):
                 raw_msg_type, raw_content = await self._fetch_message_raw(message_id)
                 if raw_msg_type == "interactive" and raw_content:
                     try:
-                        card = json.loads(raw_content)
+                        raw_parsed = json.loads(raw_content)
+                        # Some messages store the card under a "card" key
+                        card = raw_parsed.get("card") if isinstance(raw_parsed.get("card"), dict) else raw_parsed
                         elements = card.setdefault("elements", [])
+                        # Fix: if elements are double-nested (API bug), flatten them before resend
+                        if elements and isinstance(elements, list) and elements and isinstance(elements[0], list):
+                            flat_elements = []
+                            for e in elements:
+                                if isinstance(e, list):
+                                    flat_elements.extend(e)
+                                else:
+                                    flat_elements.append(e)
+                            card["elements"] = flat_elements
+                            elements = flat_elements
                         elements.append({"tag": "hr"})
                         elements.append({
                             "tag": "note",
@@ -1848,15 +1839,6 @@ class FeishuAdapter(BasePlatformAdapter):
                 request = self._build_update_message_request(message_id=message_id, request_body=body)
                 response = await asyncio.to_thread(self._client.im.v1.message.update, request)
                 result = self._finalize_send_result(response, "update failed")
-                if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
-                    logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
-                    fallback_body = self._build_update_message_body(
-                        msg_type="text",
-                        content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
-                    )
-                    fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
-                    fallback_response = await asyncio.to_thread(self._client.im.v1.message.update, fallback_request)
-                    result = self._finalize_send_result(fallback_response, "update failed")
                 if result.success:
                     result.message_id = message_id
                 return result
@@ -1866,15 +1848,6 @@ class FeishuAdapter(BasePlatformAdapter):
             request = self._build_update_message_request(message_id=message_id, request_body=body)
             response = await asyncio.to_thread(self._client.im.v1.message.update, request)
             result = self._finalize_send_result(response, "update failed")
-            if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
-                logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
-                fallback_body = self._build_update_message_body(
-                    msg_type="text",
-                    content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
-                )
-                fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
-                fallback_response = await asyncio.to_thread(self._client.im.v1.message.update, fallback_request)
-                result = self._finalize_send_result(fallback_response, "update failed")
             if result.success:
                 result.message_id = message_id
             return result
@@ -2089,10 +2062,6 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Failed to send image %s: %s", image_path, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
-
-    async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Feishu bot API does not expose a typing indicator."""
-        return None
 
     async def send_image(
         self,
@@ -3777,6 +3746,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 mentions=parent_mentions,
             )
             self._message_text_cache[message_id] = text
+            # Evict oldest entries if cache exceeds max size
+            if len(self._message_text_cache) > self._TEXT_CACHE_MAX_SIZE:
+                excess = len(self._message_text_cache) - self._TEXT_CACHE_MAX_SIZE
+                for _ in range(excess):
+                    self._message_text_cache.pop(next(iter(self._message_text_cache)))
             return text
         except Exception:
             logger.warning("[Feishu] Failed to fetch parent message %s", message_id, exc_info=True)
@@ -4138,6 +4112,8 @@ class FeishuAdapter(BasePlatformAdapter):
                         and "config" in parsed
                         and "header" in parsed
                         and "elements" in parsed):
+                    # Already a card — store so send() can return it via card_json.
+                    self._last_card_json = content_stripped
                     return "interactive", content_stripped
             except (json.JSONDecodeError, TypeError):
                 pass
@@ -4152,7 +4128,10 @@ class FeishuAdapter(BasePlatformAdapter):
             },
             "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": content}}],
         }
-        return "interactive", json.dumps(card, ensure_ascii=False)
+        card_json = json.dumps(card, ensure_ascii=False)
+        # Store so send() can return it via card_json for footer injection.
+        self._last_card_json = card_json
+        return "interactive", card_json
 
     async def _send_uploaded_file_message(
         self,
@@ -4282,13 +4261,16 @@ class FeishuAdapter(BasePlatformAdapter):
         msg = getattr(response, "msg", default_message)
         return SendResult(success=False, error=f"[{code}] {msg}", raw_response=response)
 
-    def _finalize_send_result(self, response: Any, default_message: str) -> SendResult:
+    def _finalize_send_result(
+        self, response: Any, default_message: str, *, card_json: Optional[str] = None
+    ) -> SendResult:
         if not self._response_succeeded(response):
             return self._response_error_result(response, default_message=default_message)
         return SendResult(
             success=True,
             message_id=self._extract_response_field(response, "message_id"),
             raw_response=response,
+            card_json=card_json,
         )
 
     # =========================================================================
@@ -4424,8 +4406,6 @@ class FeishuAdapter(BasePlatformAdapter):
                 return response
             except Exception as exc:
                 last_error = exc
-                if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(exc)):
-                    raise
                 if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
                     raise
                 wait_seconds = 2 ** attempt

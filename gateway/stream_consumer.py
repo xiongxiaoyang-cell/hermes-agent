@@ -16,6 +16,7 @@ Credit: jobless0x (#774, #1312), OutThisLife (#798), clicksingh (#697).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import queue
 import re
@@ -73,18 +74,6 @@ class GatewayStreamConsumer:
     # progressive edits for the remainder of the stream.
     _MAX_FLOOD_STRIKES = 3
 
-    # Reasoning/thinking tags that models emit inline in content.
-    # Must stay in sync with cli.py _OPEN_TAGS/_CLOSE_TAGS and
-    # run_agent.py _strip_think_blocks() tag variants.
-    _OPEN_THINK_TAGS = (
-        "<REASONING_SCRATCHPAD>", "<think>", "<reasoning>",
-        "<THINKING>", "<thinking>", "<thought>",
-    )
-    _CLOSE_THINK_TAGS = (
-        "</REASONING_SCRATCHPAD>", "</think>", "</reasoning>",
-        "</THINKING>", "</thinking>", "</thought>",
-    )
-
     def __init__(
         self,
         adapter: Any,
@@ -108,6 +97,9 @@ class GatewayStreamConsumer:
         self._queue: queue.Queue = queue.Queue()
         self._accumulated = ""
         self._message_id: Optional[str] = None
+        # Cached card JSON from the initial send — used by append_footer
+        # to rebuild the card with footer injected before delete+resend.
+        self._final_card_json: Optional[str] = None
         # Wall-clock timestamp (time.monotonic) when ``_message_id`` was
         # first assigned from a successful first-send.  Used by the
         # fresh-final logic to detect long-lived previews whose edit
@@ -136,9 +128,12 @@ class GatewayStreamConsumer:
         # _reset_segment_state(preserve_no_edit=True) on stream completion.
         self._last_msg_id: Optional[str] = None
 
-        # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
-        self._in_think_block = False
-        self._think_buffer = ""
+        # Deferred segment-break flag: when on_segment_break() is called but
+        # no new text has arrived yet, we set this instead of immediately
+        # resetting _message_id.  This prevents interim content (already sent
+        # to the card) from spuriously forcing a new-card cycle before the
+        # next real text delta arrives.
+        self._pending_segment_break = False
 
     @property
     def already_sent(self) -> bool:
@@ -151,8 +146,14 @@ class GatewayStreamConsumer:
         return self._final_response_sent
 
     def on_segment_break(self) -> None:
-        """Finalize the current stream segment and start a fresh message."""
-        self._queue.put(_NEW_SEGMENT)
+        """Signal a soft segment boundary that takes effect on the next text delta.
+
+        Instead of immediately forcing a new message (which would discard the
+        current card even when the content was already flushed), we defer the
+        break: set ``_pending_segment_break`` and let the next real text delta
+        trigger the actual reset.
+        """
+        self._pending_segment_break = True
 
     def on_commentary(self, text: str) -> None:
         """Queue a completed interim assistant commentary message."""
@@ -177,6 +178,7 @@ class GatewayStreamConsumer:
         self._accumulated = ""
         self._last_sent_text = ""
         self._fallback_final_send = False
+        self._final_card_json = None
         self._fallback_prefix = ""
 
     def on_delta(self, text: str) -> None:
@@ -204,107 +206,6 @@ class GatewayStreamConsumer:
     # consumer sends intermediate edits before that stripping happens.
 
     # ===========================================================================
-    # CardKit Thinking Stream — typewriter effect for reasoning/thinking blocks
-    # ===========================================================================
-    # Think-block filter (state machine — mirrors CLI's _stream_delta)
-    # ===========================================================================
-
-    async def _filter_and_accumulate(self, text: str) -> None:
-        """Add a text delta to the accumulated buffer, streaming think blocks via CardKit.
-
-        Uses a state machine that tracks whether we are inside a
-        reasoning/thinking block.  Text inside such blocks is streamed
-        to a CardKit thinking card for typewriter effect instead of
-        being discarded.
-        """
-        buf = self._think_buffer + text
-        self._think_buffer = ""
-
-        while buf:
-            if self._in_think_block:
-                # Look for the earliest closing tag
-                best_idx = -1
-                best_len = 0
-                for tag in self._CLOSE_THINK_TAGS:
-                    idx = buf.find(tag)
-                    if idx != -1 and (best_idx == -1 or idx < best_idx):
-                        best_idx = idx
-                        best_len = len(tag)
-
-                if best_len:
-                    # Found closing tag — close thinking card, process remainder
-                    self._in_think_block = False
-                    buf = buf[best_idx + best_len:]
-                else:
-                    # No closing tag yet — hold back any partial closing-tag prefix
-                    max_tag = max(len(t) for t in self._CLOSE_THINK_TAGS)
-                    self._think_buffer = buf[-max_tag:] if len(buf) > max_tag else buf
-                    return
-            else:
-                # Look for earliest opening tag at a block boundary
-                # (start of text / preceded by newline + optional whitespace).
-                # This prevents false positives when models *mention* tags
-                # in prose (e.g. "the <think> tag is used for…").
-                best_idx = -1
-                best_len = 0
-                for tag in self._OPEN_THINK_TAGS:
-                    search_start = 0
-                    while True:
-                        idx = buf.find(tag, search_start)
-                        if idx == -1:
-                            break
-                        # Block-boundary check (mirrors cli.py logic)
-                        if idx == 0:
-                            is_boundary = (
-                                not self._accumulated
-                                or self._accumulated.endswith("\n")
-                            )
-                        else:
-                            preceding = buf[:idx]
-                            last_nl = preceding.rfind("\n")
-                            if last_nl == -1:
-                                is_boundary = (
-                                    (not self._accumulated
-                                     or self._accumulated.endswith("\n"))
-                                    and preceding.strip() == ""
-                                )
-                            else:
-                                is_boundary = preceding[last_nl + 1:].strip() == ""
-
-                        if is_boundary and (best_idx == -1 or idx < best_idx):
-                            best_idx = idx
-                            best_len = len(tag)
-                            break  # first boundary hit for this tag is enough
-                        search_start = idx + 1
-
-                if best_len:
-                    # Emit text before the tag, enter think block
-                    self._accumulated += buf[:best_idx]
-                    self._in_think_block = True
-                    buf = buf[best_idx + best_len:]
-                else:
-                    # No opening tag — check for a partial tag at the tail
-                    held_back = 0
-                    for tag in self._OPEN_THINK_TAGS:
-                        for i in range(1, len(tag)):
-                            if buf.endswith(tag[:i]) and i > held_back:
-                                held_back = i
-                    if held_back:
-                        self._accumulated += buf[:-held_back]
-                        self._think_buffer = buf[-held_back:]
-                    else:
-                        self._accumulated += buf
-                    return
-
-    async def _flush_think_buffer(self) -> None:
-        """Flush any held-back partial-tag buffer into accumulated text.
-
-        Called when the stream ends (got_done) so that partial text that
-        was held back waiting for a potential open tag is not lost.
-        """
-        if self._think_buffer and not self._in_think_block:
-            self._accumulated += self._think_buffer
-            self._think_buffer = ""
 
     async def run(self) -> None:
         """Async task that drains the queue and edits the platform message."""
@@ -318,6 +219,25 @@ class GatewayStreamConsumer:
                 got_done = False
                 got_segment_break = False
                 commentary_text = None
+
+                # Pending segment break: a None-signal (tool boundary) was received
+                # but no new text has arrived yet.  Consume the flag and reset
+                # _message_id so the next text delta starts a fresh card.
+                # Bug fix: do NOT reset _message_id here. When a pending
+                # segment break is set, the accumulated text (tool description)
+                # has already been sent to _message_id. Resetting it to None
+                # here would cause the NEXT text delta to create a new message
+                # instead of editing the existing one — producing the "AI reply
+                # split into two messages" bug.
+                # The segment break is processed below (got_segment_break) after
+                # the accumulated text is drained; at that point _message_id
+                # can be safely reset because there's no more text waiting to
+                # edit the current message.
+                if self._pending_segment_break:
+                    self._pending_segment_break = False
+
+                # Consume _NEW_SEGMENT only if no deferred break is pending
+                # (both mean "new segment" but deferred is the non-destructive path)
                 while True:
                     try:
                         item = self._queue.get_nowait()
@@ -325,20 +245,15 @@ class GatewayStreamConsumer:
                             got_done = True
                             break
                         if item is _NEW_SEGMENT:
-                            got_segment_break = True
+                            if not self._pending_segment_break:
+                                got_segment_break = True
                             break
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
                             commentary_text = item[1]
                             break
-                        await self._filter_and_accumulate(item)
+                        self._accumulated += item
                     except queue.Empty:
                         break
-
-                # Flush any held-back partial-tag buffer on stream end
-                # so trailing text that was waiting for a potential open
-                # tag is not lost.
-                if got_done:
-                    await self._flush_think_buffer()
 
                 # Decide whether to flush an edit
                 now = time.monotonic()
@@ -380,9 +295,28 @@ class GatewayStreamConsumer:
                             self._final_response_sent = self._already_sent
                             return
                         if got_segment_break:
-                            self._message_id = None
-                            self._fallback_final_send = False
-                            self._fallback_prefix = ""
+                            # CRITICAL FIX: Only reset _message_id if there is
+                            # remaining accumulated text that needs a new message.
+                            # When _accumulated is empty, the content was already
+                            # sent via _send_or_edit above — resetting _message_id
+                            # here would cause the NEXT text delta to create a
+                            # second message instead of editing the existing one.
+                            # This was the root cause of the "split into two
+                            # messages" bug (OCR-confirmed: "很好，说明流式输出的
+                            # 问题已" || "修复了。...post-processing 逻辑工作正常。")
+                            if self._accumulated:
+                                self._message_id = None
+                                self._fallback_final_send = False
+                                self._fallback_prefix = ""
+                            else:
+                                # Accumulated text was already sent (via
+                                # _send_or_edit above); preserve _message_id
+                                # so next text delta edits this message.
+                                logger.debug(
+                                    "[Split-DIAG] acc empty after seg-break, "
+                                    "preserving _message_id=%s for next edit",
+                                    self._message_id,
+                                )
                         continue
 
                     # Existing message: edit it with the first chunk, then
@@ -468,7 +402,6 @@ class GatewayStreamConsumer:
                     self._reset_segment_state()
                     await self._send_commentary(commentary_text)
                     self._last_edit_time = time.monotonic()
-                    self._reset_segment_state()
 
                 # Tool boundary: reset message state so the next text chunk
                 # creates a fresh message below any tool-progress messages.
@@ -572,6 +505,8 @@ class GatewayStreamConsumer:
                 self._last_msg_id = str(result.message_id)  # survive finish() reset
                 self._already_sent = True
                 self._last_sent_text = text
+                # Cache card JSON so append_footer can rebuild with footer injected.
+                self._final_card_json = getattr(result, "card_json", None)
                 # Fresh content bubble — close off any stale tool bubble
                 # above so the next tool starts a new bubble below.
                 self._notify_new_message()
@@ -802,11 +737,32 @@ class GatewayStreamConsumer:
             pass  # best-effort — don't let this block the fallback path
 
     async def _send_commentary(self, text: str) -> bool:
-        """Send a completed interim assistant commentary message."""
+        """Send a completed interim assistant commentary message.
+
+        If an existing message is already being edited (_message_id is set and
+        not __no_edit__), the commentary text is non-essential (e.g. a </note>
+        closing a think block from MiniMax-M2) and should NOT create a second
+        message that splits from the main response.  Skip it in that case.
+
+        Otherwise send it as a new message.
+        """
         text = self._clean_for_display(text)
         if not text.strip():
             return False
         try:
+            # CRITICAL FIX: If the main response was already delivered to this
+            # same message (_message_id is set), don't send a second message.
+            # MiniMax-M2 emits </note> tags as interim commentary but the closing
+            # note is not useful to display and would cause a "split into two
+            # messages" bug (e.g. main content in message #1, "2" alone in #2).
+            if self._message_id and self._message_id != "__no_edit__":
+                logger.debug(
+                    "[Commentary-DIAG] Skipping commentary %r — "
+                    "main content already delivered in message %s",
+                    text, self._message_id,
+                )
+                return True
+
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
@@ -900,6 +856,8 @@ class GatewayStreamConsumer:
         self._already_sent = True
         self._last_sent_text = text
         self._final_response_sent = True
+        # Cache card JSON so append_footer can rebuild the card with footer injected.
+        self._final_card_json = getattr(result, "card_json", None)
         return True
 
     async def _send_or_edit(self, text: str, *, finalize: bool = False) -> bool:
@@ -1030,55 +988,43 @@ class GatewayStreamConsumer:
             return False
 
     async def append_footer(self, footer_line: str) -> bool:
-        """Append footer to the already-sent message via edit_message.
+        """Rebuild the sent card with footer injected, delete old card, resend.
 
-        Uses _last_sent_text as the base so we always have the full message
-        content to combine, regardless of whether the platform's edit_message
-        does an in-place append or a full replace.
+        Instead of appending footer as a separate message (which puts it in a
+        separate bubble below the card), we rebuild the original card JSON,
+        inject the footer into elements[], delete the old card, and resend.
+        This keeps footer inside the card body.
         """
         if not footer_line or not self._already_sent:
             return False
-        if not self._message_id:
-            # No message_id means edit_message can't work — let the caller fall
-            # back to appending footer as plain text to the response string.
+        if not self._final_card_json:
             return False
         try:
-            _chat_type = None
-            if self.metadata:
-                _chat_type = self.metadata.get("chat_type")
-            # Pass just the footer_line. For interactive cards, edit_message
-            # will embed it as a note element. For text/post, edit_message
-            # will fetch existing text and combine with the footer.
-            result = await self.adapter.edit_message(
+            card_data = json.loads(self._final_card_json)
+            elements = card_data.setdefault("elements", [])
+            elements.append({"tag": "hr"})
+            elements.append({
+                "tag": "note",
+                "elements": [{"tag": "plain_text", "content": footer_line}],
+            })
+            new_card_json = json.dumps(card_data, ensure_ascii=False)
+            old_msg_id = getattr(self, "_message_id", None)
+            if old_msg_id:
+                try:
+                    await self.adapter.delete_message(self.chat_id, old_msg_id)
+                except Exception as _del_err:
+                    logger.debug("append_footer delete-old failed: %s", _del_err)
+            result = await self.adapter.send(
                 chat_id=self.chat_id,
-                message_id=self._message_id,
-                content=footer_line,
-                finalize=True,
-                chat_type=_chat_type,
-                append=True,  # Feishu will fetch+combine or inject note
+                content=new_card_json,
+                metadata=self.metadata,
             )
             if result.success:
-                self._last_sent_text = f"{getattr(self, '_last_sent_text', '')}\n\n{footer_line}"
+                self._message_id = str(result.message_id)
+                logger.info("append_footer rebuild succeeded (old=%s new=%s)", old_msg_id, result.message_id)
                 return True
-            else:
-                logger.warning("append_footer edit_message failed: %s", result)
-                # Fallback: send footer as a separate tiny message.
-                # Needed for platforms where the original message is an
-                # interactive card that can't be edited (e.g. Feishu 230054).
-                try:
-                    fallback_result = await self.adapter.send(
-                        chat_id=self.chat_id,
-                        content=footer_line,
-                        metadata=self.metadata,
-                        chat_type=_chat_type,
-                    )
-                    if fallback_result.success:
-                        logger.info("append_footer fallback send succeeded")
-                        return True
-                    logger.warning("append_footer fallback send failed: %s", fallback_result)
-                except Exception as send_err:
-                    logger.error("append_footer fallback send error: %s", send_err)
-                return False
+            logger.warning("append_footer resend failed: %s", result)
+            return False
         except Exception as e:
             logger.error("append_footer error: %s", e)
             return False

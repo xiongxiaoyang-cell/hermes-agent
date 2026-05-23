@@ -989,6 +989,9 @@ class SendResult:
     error: Optional[str] = None
     raw_response: Any = None
     retryable: bool = False  # True for transient connection errors — base will retry automatically
+    # Feishu: set by adapter.send() when the outbound payload was an interactive card.
+    # Allows stream consumers to capture and rebuild the card with footer injected.
+    card_json: Optional[str] = None
 
 
 class EphemeralReply(str):
@@ -3415,8 +3418,23 @@ class BasePlatformAdapter(ABC):
             split_at = region.rfind("\n")
             if split_at < _cp_limit // 2:
                 split_at = region.rfind(" ")
+
+            # Hard-split fallback: look for sentence-ending punctuation
+            # within a generous window after the initial split point.
+            # This prevents cutting mid-sentence when no space/newline exists.
             if split_at < 1:
-                split_at = _cp_limit
+                SENTENCE_END = "。！？.!?…—"
+                look_back_start = max(0, _cp_limit - 200)
+                search_region = remaining[look_back_start:_cp_limit + 200]
+                best_sentence_end = -1
+                for sep in SENTENCE_END:
+                    pos = search_region.rfind(sep)
+                    if pos != -1 and (best_sentence_end == -1 or pos > best_sentence_end):
+                        best_sentence_end = pos
+                if best_sentence_end >= 0:
+                    split_at = look_back_start + best_sentence_end + 1
+                else:
+                    split_at = _cp_limit
 
             # Avoid splitting inside an inline code span (`...`).
             # If the text before split_at has an odd number of unescaped
