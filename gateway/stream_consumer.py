@@ -890,7 +890,7 @@ class GatewayStreamConsumer:
         # This was reported on Telegram, Matrix, and other clients where the
         # ▉ block character renders as a visible white box ("tofu").
         # Existing messages (edits) are unaffected — only first sends gated.
-        _MIN_NEW_MSG_CHARS = 4
+        _MIN_NEW_MSG_CHARS = 0  # 0=立即发出，不等待后续合并（避免多卡分叉）
         if (self._message_id is None
                 and self.cfg.cursor
                 and self.cfg.cursor in text
@@ -960,12 +960,14 @@ class GatewayStreamConsumer:
                 # First message — send new
                 meta = dict(self.metadata) if self.metadata else {}
                 _chat_type = meta.pop("chat_type", None) if meta else None
+                logger.warning("DEBUG_SEND: chat_id=%s text_len=%s meta=%s", self.chat_id, len(text), meta)
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=text,
                     metadata=meta,
                     chat_type=_chat_type,
                 )
+                logger.warning("DEBUG_SEND_RESULT: success=%s message_id=%s error=%s", result.success, getattr(result, 'message_id', None), getattr(result, 'error', None))
                 if result.success:
                     if result.message_id:
                         self._message_id = result.message_id

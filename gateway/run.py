@@ -6860,6 +6860,55 @@ class GatewayRunner:
                 _footer_line = ""
             logger.info("runtime_footer: _footer_line=%r elapsed=%.2fs success=%s model=%s agent=%s", _footer_line, _elapsed or 0, _success, agent_result.get("model") or "", _agent_name)
 
+            # === NON-STREAMING PATH: direct send via adapter ===
+            # This is the path when streaming is DISABLED. Check if streaming
+            # consumer has already delivered the message; if not, send now.
+            _sc = self._stream_consumer_holder[0]
+            _old_msg_id = getattr(_sc, "_message_id", None) if _sc else None
+
+            if _sc is None or _old_msg_id is None:
+                # No streaming consumer — non-streaming path. Send via adapter.
+                _adapter = self.adapters.get(source.platform)
+                if _adapter:
+                    try:
+                        # Build card metadata: header shows user question + color reflects outcome
+                        _status_template = "green" if _success else ("orange" if not _success else "blue")
+                        _card_meta = dict(getattr(source, "metadata", None) or {})
+                        _user_question = (event.text or "")[:50].replace("\n", " ").strip()
+                        _sender_name = getattr(source, "user_name", None) or _agent_name
+                        if _user_question:
+                            _header_title = f"回复 {_sender_name}: {_user_question}"
+                        else:
+                            _header_title = f"🤖 {_agent_name}"
+                        _card_meta["card_header"] = {
+                            "title": _header_title,
+                            "template": _status_template,
+                        }
+                        # Pass _footer_line → feishu adapter injects hr+note footer in _build_outbound_payload
+                        if _footer_line:
+                            _card_meta["_footer_line"] = _footer_line
+                        _send_result = await _adapter.send(
+                            chat_id=source.chat_id,
+                            content=response,
+                            metadata=_card_meta,
+                        )
+                        if _send_result.success:
+                            agent_result["already_sent"] = True
+                        logger.info(
+                            "NON_STREAMING send success=%s msg_id=%s",
+                            _send_result.success, getattr(_send_result, "message_id", None),
+                        )
+                    except Exception as _send_err:
+                        logger.error("NON_STREAMING send failed: %s", _send_err)
+                else:
+                    logger.warning("no adapter for platform %s", source.platform)
+
+            # === RUNTIME FOOTER: trailing edit via stream consumer ===
+            _sc = self._stream_consumer_holder[0]
+            _old_msg_id = getattr(_sc, "_message_id", None) if _sc else None
+            if _sc and _old_msg_id:
+                _cached = getattr(_sc, "_final_card_json", None)
+
             if _footer_line and response:
                 # Plan A (2026-05-21): For interactive cards, inject footer directly
                 # into elements[] instead of relying on streaming edit_message which
@@ -6879,11 +6928,21 @@ class GatewayRunner:
 
                 if _is_card and _card_data:
                     _elements = _card_data.setdefault("elements", [])
-                    _elements.append({"tag": "hr"})
-                    _elements.append({
-                        "tag": "note",
-                        "elements": [{"tag": "plain_text", "content": _footer_line}],
-                    })
+                    # Guard: skip if footer note already injected (already_sent path)
+                    _has_note = any(
+                        isinstance(e, dict) and e.get("tag") == "note"
+                        and e.get("elements", [{}])[0].get("content", "").startswith(_footer_line[:20])
+                        for e in _elements
+                    )
+                    if _has_note:
+                        _footer_appended = True
+                    else:
+                        _elements.append({"tag": "hr"})
+                        _elements.append({
+                            "tag": "note",
+                            "elements": [{"tag": "plain_text", "content": _footer_line}],
+                        })
+                        _footer_appended = True
                     response = json.dumps(_card_data, ensure_ascii=False)
 
                     # Streaming path: the card was already sent by stream consumer
@@ -6915,15 +6974,51 @@ class GatewayRunner:
                         else:
                             _footer_appended = False
                 else:
-                    # Original logic for non-card responses (text/post).
+                    # Non-card response (text/post) OR card path took non-card fallback.
+                    # Use delete+resend to inject footer properly rather than naive
+                    # text concatenation which would corrupt any card JSON.
                     _sc = self._stream_consumer_holder[0]
-                    _footer_appended = False
-                    if _sc and hasattr(_sc, "append_footer"):
-                        _footer_appended = await _sc.append_footer(_footer_line)
-                    if not _footer_appended:
-                        # Fallback: append footer as plain text to the response.
+                    _old_msg_id = getattr(_sc, "_message_id", None) if _sc else None
+                    _footer_resent = False
+                    # If _final_card_json exists (cached by stream_consumer after send),
+                    # the original message was a card — use it to preserve card structure
+                    # with footer injected, rather than falling back to plain text response.
+                    _resend_content = None
+                    if _sc:
+                        _cached_card = getattr(_sc, "_final_card_json", None)
+                        if _cached_card and isinstance(_cached_card, str):
+                            try:
+                                _cached_card_parsed = json.loads(_cached_card)
+                            except Exception:
+                                _cached_card_parsed = None
+                            if _cached_card_parsed and isinstance(_cached_card_parsed, dict):
+                                _elements = _cached_card_parsed.setdefault("elements", [])
+                                _elements.append({"tag": "hr"})
+                                _elements.append({
+                                    "tag": "note",
+                                    "elements": [{"tag": "plain_text", "content": _footer_line}],
+                                })
+                                _resend_content = json.dumps(_cached_card_parsed, ensure_ascii=False)
+                    if _resend_content is None:
+                        _resend_content = response
+                    if _sc and _old_msg_id:
+                        try:
+                            await _sc.adapter.delete_message(_sc.chat_id, _old_msg_id)
+                        except Exception as _del_err:
+                            logger.warning("Footer non-card delete failed (msg_id=%s): %s", _old_msg_id, _del_err)
+                        try:
+                            await _sc.adapter.send(
+                                chat_id=_sc.chat_id,
+                                content=_resend_content,
+                                metadata=getattr(_sc, "metadata", None),
+                            )
+                            _footer_resent = True
+                        except Exception as _resend_err:
+                            logger.error("Footer non-card resend FAILED (session=%s): %s", session_key, _resend_err)
+                    if not _footer_resent:
+                        # Ultimate fallback: append footer as plain text.
                         # Only reached when streaming is off, no stream consumer,
-                        # or edit_message failed (no message_id).
+                        # or both delete and resend failed.
                         response = f"{response}\n\n{_footer_line}"
 
             # Emit agent:end hook

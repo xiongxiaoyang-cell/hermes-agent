@@ -101,6 +101,7 @@ try:
         ReplyMessageRequestBody,
         UpdateMessageRequest,
         UpdateMessageRequestBody,
+        DeleteMessageRequest,
     )
     from lark_oapi.core import AccessTokenType, HttpMethod
     from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
@@ -1722,7 +1723,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         try:
             for idx, chunk in enumerate(chunks):
-                msg_type, payload = self._build_outbound_payload(chunk, chat_type=chat_type)
+                msg_type, payload = self._build_outbound_payload(chunk, chat_type=chat_type, metadata=metadata)
                 response = await self._feishu_send_with_retry(
                     chat_id=chat_id,
                     msg_type=msg_type,
@@ -4101,7 +4102,7 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound payload construction and send pipeline
     # =========================================================================
 
-    def _build_outbound_payload(self, content: str, *, chat_type: Optional[str] = None) -> tuple[str, str]:
+    def _build_outbound_payload(self, content: str, *, chat_type: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> tuple[str, str]:
         # If content is already an interactive card JSON, pass it through
         # directly to avoid double-wrapping (e.g. footer-injected cards).
         content_stripped = content.strip()
@@ -4118,15 +4119,81 @@ class FeishuAdapter(BasePlatformAdapter):
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        # Wrap all outbound text in a minimal Feishu interactive card.
-        # This makes every message (DM reply, group message, etc.) a card.
+        # metadata drives card appearance
+        meta = metadata or {}
+        card_header = meta.get("card_header", {})
+        header_title = card_header.get("title", "🤖 Hermes Agent")
+        # lobster style: default orange, blue for info, green/red for success/failure
+        header_template = card_header.get("template", "orange")
+
+        # lobster style: multi-paragraph support (split on \n\n)
+        # Extract trailing signature (e.g. "David Yang：" or "小锴") for smaller rendering
+        # Pattern: content ends with "Name：" or "Name" (2-6 chars, Chinese/ASCII + optional ：)
+        _signature = None
+        _content = content
+        # Signature: preceded by \n\n, extracted from end
+        # Pattern: \n\n + (Chinese 2-6 chars OR ASCII name up to 20 chars) + optional ：
+        import re
+        _sig_match = re.search(r'\n\n([\u4e00-\u9fff·～「」『』]{2,6}|[A-Za-z][A-Za-z\s]{1,19})\s*：?\s*$', content)
+        if _sig_match:
+            _signature = _sig_match.group(1).strip().rstrip('：')
+            _content = content[:_sig_match.start()]
+        else:
+            _content = content
+        # Split remaining content into paragraphs for structured display
+        if "\n\n" in _content:
+            _paras = _content.split("\n\n")
+            elements = [{"tag": "div", "text": {"tag": "plain_text", "content": p.strip()}} for p in _paras if p.strip()]
+        else:
+            elements = [{"tag": "div", "text": {"tag": "plain_text", "content": _content}}]
+
+        # Append signature in smaller text — David Yang in grey, 小锴 in header color
+        if _signature:
+            _is_chinese_sig = re.match(r'^[\u4e00-\u9fff·～「」『』]+$', _signature)
+            _sig_color = header_template if _is_chinese_sig else "grey"
+            elements.append({
+                "tag": "div",
+                "text": {
+                    "tag": "plain_text",
+                    "content": _signature,
+                    "attrs": {"font_size": "small", "color": _sig_color},
+                },
+            })
+
+        # Footer action row if buttons provided
+        footer_buttons = meta.get("card_footer_buttons", [])
+        if footer_buttons:
+            action_element = {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": btn.get("label", "")},
+                        "type": btn.get("type", "default"),
+                        "value": btn.get("value", {}),
+                    }
+                    for btn in footer_buttons
+                ],
+            }
+            elements.append({"tag": "hr"})
+            elements.append(action_element)
+
+        # Pre-inject footer if provided via metadata (lobster style: hr + note block)
+        _footer_line = meta.get("_footer_line")
+        if _footer_line:
+            elements.append({"tag": "hr"})
+            elements.append({
+                "tag": "note",
+                "elements": [{"tag": "plain_text", "content": _footer_line, "attrs": {"font_size": "small"}}],
+            })
+
         card = {
             "config": {"wide_screen_mode": True},
             "header": {
-                "title": {"content": "🤖 Hermes Agent", "tag": "plain_text"},
-                "template": "blue",
+                "title": {"content": header_title, "tag": "plain_text"},
+                "template": header_template,
             },
-            "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": content}}],
+            "elements": elements,
         }
         card_json = json.dumps(card, ensure_ascii=False)
         # Store so send() can return it via card_json for footer injection.
