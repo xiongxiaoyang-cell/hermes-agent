@@ -3945,14 +3945,16 @@ def _setup_feishu():
 
         # Try to probe the bot with manual credentials
         bot_name = None
+        probe_ok = False
         try:
-            from gateway.platforms.feishu import probe_bot
+            from gateway.platforms.feishu import probe_bot, _write_secret_with_backup
             bot_info = probe_bot(app_id, app_secret, domain)
             if bot_info:
                 bot_name = bot_info.get("bot_name")
                 print_success(f"  Credentials verified — bot: {bot_name or 'unnamed'}")
+                probe_ok = True
             else:
-                print_warning("  Could not verify bot connection. Credentials saved anyway.")
+                print_warning("  Could not verify bot connection. Credentials NOT saved — old secret kept.")
         except Exception as exc:
             print_warning(f"  Credential verification skipped: {exc}")
 
@@ -3962,6 +3964,7 @@ def _setup_feishu():
             "domain": domain,
             "open_id": None,
             "bot_name": bot_name,
+            "probe_ok": probe_ok,
         }
 
     # ── Save core credentials ──
@@ -3970,10 +3973,15 @@ def _setup_feishu():
     domain = credentials.get("domain", "feishu")
     open_id = credentials.get("open_id")
     bot_name = credentials.get("bot_name")
+    probe_ok = credentials.get("probe_ok", False)
 
-    save_env_value("FEISHU_APP_ID", app_id)
-    save_env_value("FEISHU_APP_SECRET", app_secret)
-    save_env_value("FEISHU_DOMAIN", domain)
+    # Step 1: write-time validation — only save if token API verified
+    if not probe_ok:
+        print_warning("  App Secret NOT written (probe failed). Old secret still active.")
+    else:
+        save_env_value("FEISHU_APP_ID", app_id)
+        _write_secret_with_backup(app_secret)
+        save_env_value("FEISHU_DOMAIN", domain)
     # Bot identity is resolved at runtime via _hydrate_bot_identity().
 
     # ── Connection mode ──

@@ -4480,10 +4480,16 @@ class GatewayRunner:
             return DingTalkAdapter(config)
 
         elif platform == Platform.FEISHU:
-            from gateway.platforms.feishu import FeishuAdapter, check_feishu_requirements
+            from gateway.platforms.feishu import FeishuAdapter, check_feishu_requirements, _rollback_secret_if_invalid
+            from hermes_cli.config import get_env_value
             if not check_feishu_requirements():
                 logger.warning("Feishu: lark-oapi not installed or FEISHU_APP_ID/SECRET not set")
                 return None
+            app_id = get_env_value("FEISHU_APP_ID")
+            app_secret = get_env_value("FEISHU_APP_SECRET")
+            domain = get_env_value("FEISHU_DOMAIN", "feishu")
+            if app_id and app_secret:
+                _rollback_secret_if_invalid(app_id, app_secret, domain)
             return FeishuAdapter(config)
 
         elif platform == Platform.WECOM_CALLBACK:

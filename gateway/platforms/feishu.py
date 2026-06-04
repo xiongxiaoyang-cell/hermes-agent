@@ -4958,6 +4958,63 @@ def _probe_bot_http(app_id: str, app_secret: str, domain: str) -> Optional[dict]
         return None
 
 
+# ─── Backup / Rollback ────────────────────────────────────────────────────────
+
+_BACKUP_ENV_VAR = "FEISHU_APP_SECRET"
+_BACKUP_PATH = Path.home() / ".hermes" / ".feishu_secret_backup"
+
+
+def _backup_secret(app_secret: str) -> None:
+    """Write current app_secret to backup file."""
+    try:
+        _BACKUP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _BACKUP_PATH.write_text(app_secret, encoding="utf-8")
+    except Exception as exc:
+        logger.debug("[Feishu backup] Could not write secret backup: %s", exc)
+
+
+def _restore_secret() -> Optional[str]:
+    """Restore app_secret from backup file. Returns the secret or None."""
+    try:
+        if _BACKUP_PATH.exists():
+            return _BACKUP_PATH.read_text(encoding="utf-8").strip()
+    except Exception as exc:
+        logger.debug("[Feishu backup] Could not read secret backup: %s", exc)
+    return None
+
+
+def _write_secret_with_backup(app_secret: str) -> None:
+    """Write secret to .env, first backing up the current value."""
+    from hermes_cli.config import save_env_value
+    # Backup existing value before writing new one
+    existing = os.getenv("FEISHU_APP_SECRET", "").strip()
+    if existing:
+        _backup_secret(existing)
+    save_env_value(_BACKUP_ENV_VAR, app_secret)
+
+
+def _rollback_secret_if_invalid(app_id: str, app_secret: str, domain: str) -> bool:
+    """At startup: check if current secret is valid. If not, try to restore from backup.
+
+    Returns True if the secret is valid (no rollback needed or rollback succeeded),
+    False if no valid secret could be restored.
+    """
+    from hermes_cli.config import get_env_value
+    if probe_bot(app_id, app_secret, domain) is not None:
+        return True  # current secret is valid
+
+    logger.warning("[Feishu] Current app_secret is invalid — attempting rollback from backup")
+    restored = _restore_secret()
+    if restored and probe_bot(app_id, restored, domain) is not None:
+        logger.info("[Feishu] Rollback successful — restored previous app_secret")
+        from hermes_cli.config import save_env_value
+        save_env_value(_BACKUP_ENV_VAR, restored)
+        return True
+
+    logger.error("[Feishu] Rollback failed — no valid app_secret found. Run `hermes gateway --setup` to reconfigure.")
+    return False
+
+
 def qr_register(
     *,
     initial_domain: str = "feishu",
