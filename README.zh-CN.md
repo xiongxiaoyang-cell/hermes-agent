@@ -19,7 +19,7 @@
 <table>
 <tr><td><b>真正的终端界面</b></td><td>完整的 TUI，支持多行编辑、斜杠命令自动补全、对话历史、中断重定向和流式工具输出。</td></tr>
 <tr><td><b>随你所在</b></td><td>Telegram、Discord、Slack、WhatsApp、Signal 和 CLI——全部从单个网关进程运行。语音备忘录转写、跨平台对话连续性。</td></tr>
-<tr><td><b>闭环学习</b></td><td>代理管理记忆并定期自我提醒。复杂任务后自动创建技能。技能在使用中自我改进。FTS5 会话搜索配合 LLM 摘要实现跨会话回溯。<a href="https://github.com/plastic-labs/honcho">Honcho</a> 辩证式用户建模。兼容 <a href="https://agentskills.io">agentskills.io</a> 开放标准。</td></tr>
+<tr><td><b>闭环学习</b></td><td>代理管理记忆并定期自我提醒。复杂任务后自动创建技能。技能在使用中自我改进。<code>memory_search</code> 工具统一了 FTS5 会话搜索 + lobster 知识库 RAG（BGE-small-zh, 18,382 chunks）实现跨会话回溯。<a href="https://github.com/plastic-labs/honcho">Honcho</a> 辩证式用户建模。兼容 <a href="https://agentskills.io">agentskills.io</a> 开放标准。技能可通过"三段式召回"模式（预登记索引 → 路径前缀过滤 → 语义降级）升级接入 lobster 知识库。</td></tr>
 <tr><td><b>定时自动化</b></td><td>内置 cron 调度器，支持向任何平台投递。日报、夜间备份、周审计——全部用自然语言描述，无人值守运行。</td></tr>
 <tr><td><b>委派与并行</b></td><td>生成隔离子代理处理并行工作流。编写 Python 脚本通过 RPC 调用工具，将多步管道压缩为零上下文开销的轮次。</td></tr>
 <tr><td><b>随处运行</b></td><td>六种终端后端——本地、Docker、SSH、Daytona、Singularity 和 Modal。Daytona 和 Modal 提供 Serverless 持久化——代理环境空闲时休眠、按需唤醒，空闲期间几乎零成本。$5 VPS 或 GPU 集群都能跑。</td></tr>
@@ -176,6 +176,21 @@ python -m pytest tests/ -q
 - 🐛 [问题反馈](https://github.com/NousResearch/hermes-agent/issues)
 - 💡 [讨论区](https://github.com/NousResearch/hermes-agent/discussions)
 - 🔌 [HermesClaw](https://github.com/AaronWong1999/hermesclaw) — 社区微信桥接：在同一微信账号上运行 Hermes Agent 和 OpenClaw。
+
+---
+
+## 本 fork 的近期改动
+
+`xiongxiaoyang-cell/hermes-agent`（个人 fork，集成出海HR-Skill 工具链）的关键 commit：
+
+| Commit | 日期 | 说明 |
+|--------|------|------|
+| `89a320541` | 2026-06-20 | **feat(tools): memory_search** — 统一跨会话 Agent 长期记忆检索（FTS5 会话 + lobster RAG） |
+| `f267016` | 2026-06-20 | **feat(skills): 同步 jd-template-fetcher** 到 lobster 出海HR-Skill 套装（lobster 仓） |
+| `d18bf21` | 2026-06-20 | **feat(jd): RAG 内部 JD 案例检索** — 首个 skill RAG 升级（jd-template-fetcher） |
+| `68471c3` | 2026-06-20 | **feat(japan-employer-cost): RAG 政策 + 历史案例检索** — 第二个 skill RAG 升级（lobster 仓） |
+
+**Skill RAG 升级模式**（可复用）：见 `~/.hermes/skills/productivity/skill-rag-upgrade/SKILL.md` — 三段式召回（预登记索引 → 路径前缀过滤 → BGE-small-zh 语义降级）。已应用于 `jd-template-fetcher` 和 `japan-employer-cost`；下一个候选是 `country-guide-plus` 和 `training-camp-ops`。
 
 ---
 

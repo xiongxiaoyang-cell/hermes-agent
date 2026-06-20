@@ -19,7 +19,7 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), [Open
 <table>
 <tr><td><b>A real terminal interface</b></td><td>Full TUI with multiline editing, slash-command autocomplete, conversation history, interrupt-and-redirect, and streaming tool output.</td></tr>
 <tr><td><b>Lives where you do</b></td><td>Telegram, Discord, Slack, WhatsApp, Signal, and CLI — all from a single gateway process. Voice memo transcription, cross-platform conversation continuity.</td></tr>
-<tr><td><b>A closed learning loop</b></td><td>Agent-curated memory with periodic nudges. Autonomous skill creation after complex tasks. Skills self-improve during use. FTS5 session search with LLM summarization for cross-session recall. <a href="https://github.com/plastic-labs/honcho">Honcho</a> dialectic user modeling. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard.</td></tr>
+<tr><td><b>A closed learning loop</b></td><td>Agent-curated memory with periodic nudges. Autonomous skill creation after complex tasks. Skills self-improve during use. <code>memory_search</code> tool unifies FTS5 session search + lobster knowledge-base RAG (BGE-small-zh, 18,382 chunks) for cross-session recall. <a href="https://github.com/plastic-labs/honcho">Honcho</a> dialectic user modeling. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard. Skills can be RAG-upgraded to query the lobster knowledge base via a 3-stage pattern (pre-registered index → path-prefix filter → semantic fallback).</td></tr>
 <tr><td><b>Scheduled automations</b></td><td>Built-in cron scheduler with delivery to any platform. Daily reports, nightly backups, weekly audits — all in natural language, running unattended.</td></tr>
 <tr><td><b>Delegates and parallelizes</b></td><td>Spawn isolated subagents for parallel workstreams. Write Python scripts that call tools via RPC, collapsing multi-step pipelines into zero-context-cost turns.</td></tr>
 <tr><td><b>Runs anywhere, not just your laptop</b></td><td>Seven terminal backends — local, Docker, SSH, Singularity, Modal, Daytona, and Vercel Sandbox. Daytona and Modal offer serverless persistence — your agent's environment hibernates when idle and wakes on demand, costing nearly nothing between sessions. Run it on a $5 VPS or a GPU cluster.</td></tr>
@@ -171,6 +171,21 @@ scripts/run_tests.sh
 - 📚 [Skills Hub](https://agentskills.io)
 - 🐛 [Issues](https://github.com/NousResearch/hermes-agent/issues)
 - 🔌 [HermesClaw](https://github.com/AaronWong1999/hermesclaw) — Community WeChat bridge: Run Hermes Agent and OpenClaw on the same WeChat account.
+
+---
+
+## Recent Additions (this fork)
+
+Notable commits in `xiongxiaoyang-cell/hermes-agent` (personal fork with 出海HR-Skill 工具链 integration):
+
+| Commit | Date | Description |
+|--------|------|-------------|
+| `89a320541` | 2026-06-20 | **feat(tools): memory_search** — unified cross-session Agent long-term memory retrieval (FTS5 sessions + lobster RAG) |
+| `f267016` | 2026-06-20 | **feat(skills): 同步 jd-template-fetcher** to lobster 出海HR-Skill 套装 (lobster repo) |
+| `d18bf21` | 2026-06-20 | **feat(jd): RAG 内部 JD 案例检索** — first skill RAG-upgrade (jd-template-fetcher) |
+| `68471c3` | 2026-06-20 | **feat(japan-employer-cost): RAG 政策 + 历史案例检索** — second skill RAG-upgrade (lobster repo) |
+
+**Skill RAG-upgrade pattern** (reusable): see `~/.hermes/skills/productivity/skill-rag-upgrade/SKILL.md` — three-stage recall (pre-registered index → path-prefix filter → BGE-small-zh semantic fallback). Already applied to `jd-template-fetcher` and `japan-employer-cost`; next candidates are `country-guide-plus` and `training-camp-ops`.
 
 ---
 
