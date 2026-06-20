@@ -190,6 +190,70 @@ def status() -> Dict[str, Any]:
     }
 
 
+
+
+def incremental_update() -> Dict[str, Any]:
+    """增量更新：只处理 state.db 中新于 Chroma 已有 session 的 session
+
+    流程：
+      1. 列 Chroma 已有 session_id + max(started_at)
+      2. 查 state.db 的新 session（started_at > last_built_ts）
+      3. 算 embedding + 增量 add
+    """
+    INDEX_DIR_PATH = Path(INDEX_DIR)
+    INDEX_DIR_PATH.mkdir(parents=True, exist_ok=True)
+
+    client = chromadb.PersistentClient(path=INDEX_DIR)
+    if COLLECTION_NAME not in [c.name for c in client.list_collections()]:
+        return {"success": False, "error": "collection not exists, run build first"}
+    collection = client.get_collection(COLLECTION_NAME)
+
+    # 1. 列已有 session 的最大 started_at
+    existing = collection.get(include=["metadatas"], limit=10000)
+    existing_ids = set(existing["ids"])
+    last_ts = 0
+    for m in existing.get("metadatas") or []:
+        ts = m.get("started_at", 0) or 0
+        if ts > last_ts:
+            last_ts = ts
+
+    # 2. 查 state.db 的新 session
+    all_sessions = get_session_texts()
+    new_sessions = [s for s in all_sessions if s["session_id"] not in existing_ids]
+    if not new_sessions:
+        return {"success": True, "new_count": 0, "last_ts": last_ts, "elapsed_sec": 0}
+
+    # 3. 算 embedding + 增量 add
+    print(f"  发现 {len(new_sessions)} 个新 session（已有 {len(existing_ids)}）")
+    model = SentenceTransformer(MODEL)
+    texts = [s["text"] for s in new_sessions]
+    t0 = time.time()
+    embeddings = model.encode(texts, normalize_embeddings=True, batch_size=BATCH_SIZE, show_progress_bar=False)
+    for i in range(0, len(new_sessions), BATCH_SIZE):
+        batch_sess = new_sessions[i:i + BATCH_SIZE]
+        batch_emb = embeddings[i:i + BATCH_SIZE].tolist()
+        collection.add(
+            ids=[s["session_id"] for s in batch_sess],
+            embeddings=batch_emb,
+            documents=[s["text"] for s in batch_sess],
+            metadatas=[{
+                "source": s["source"],
+                "user_id": s["user_id"],
+                "model": s["model"],
+                "started_at": s["started_at"],
+                "msg_count": s["msg_count"],
+            } for s in batch_sess],
+        )
+    return {
+        "success": True,
+        "new_count": len(new_sessions),
+        "existing_before": len(existing_ids),
+        "existing_after": collection.count(),
+        "elapsed_sec": round(time.time() - t0, 1),
+    }
+
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Session Semantic Index")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -207,6 +271,9 @@ if __name__ == "__main__":
     # status
     subparsers.add_parser("status", help="查询索引状态")
 
+    # incremental
+    subparsers.add_parser("incremental", help="增量更新（只算新 session）")
+
     args = parser.parse_args()
 
     if args.command == "build":
@@ -223,3 +290,11 @@ if __name__ == "__main__":
 
     elif args.command == "status":
         print(json.dumps(status(), ensure_ascii=False, indent=2))
+
+    elif args.command == "incremental":
+        print("=" * 70)
+        print("  增量更新 session semantic 索引")
+        print("=" * 70)
+        result = incremental_update()
+        print()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
