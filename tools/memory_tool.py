@@ -60,6 +60,37 @@ ENTRY_DELIMITER = "\n§\n"
 
 
 # ---------------------------------------------------------------------------
+# v2: section 自动分类（2026-06-20）
+# ---------------------------------------------------------------------------
+SECTION_LABELS = ("[事实]", "[约定]", "[工具]", "[索引]", "[陷阱]", "[里程碑]")
+
+# 关键词 → section 映射（顺序敏感：先匹配 [陷阱]，再匹配其他）
+_SECTION_KEYWORDS = [
+    ("[陷阱]", ("坑", "pitfall", "避坑", "陷阱", "错误", "fail", "失败", "bug", "⚠", "注意", "警告")),
+    ("[里程碑]", ("里程碑", "milestone", "阶段", "今天", "今日")),
+    ("[工具]", ("工具", "tool", "script", "API", "接口", "已部署", "部署", "函数", "脚本", "system", "机制")),
+    ("[索引]", ("索引", "清单", "index", "list", "列表")),
+    ("[约定]", ("约定", "约束", "硬约束", "convention", "规则", "原则", "禁用", "禁止", "符号")),
+    ("[事实]", ("事实", "fact", "环境", "兼容", "路径", "环境事实", "特性")),
+]
+
+
+def auto_classify_section(content: str) -> Optional[str]:
+    """根据 content 关键词自动判断 section（返回 [事实]/[约定]/[工具]/[索引]/[陷阱]/[里程碑]）
+
+    优先级：[陷阱] > [里程碑] > [工具] > [索引] > [约定] > [事实]
+    """
+    if not content:
+        return None
+    content_lower = content.lower()
+    for label, keywords in _SECTION_KEYWORDS:
+        for kw in keywords:
+            if kw.lower() in content_lower:
+                return label
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Memory content scanning — lightweight check for injection/exfiltration
 # in content that gets injected into the system prompt.
 # ---------------------------------------------------------------------------
@@ -221,16 +252,27 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
-    def add(self, target: str, content: str) -> Dict[str, Any]:
-        """Append a new entry. Returns error if it would exceed the char limit."""
+    def add(self, target: str, content: str, section: Optional[str] = None) -> Dict[str, Any]:
+        """Append a new entry. Returns error if it would exceed the char limit.
+
+        v2 改进（2026-06-20）：
+        - section 参数：自动加 [事实]/[约定]/[工具]/[索引]/[陷阱]/[里程碑] 标签
+        - auto_classify_section(content)：根据关键词自动判断 section（不传 section 时）
+        """
         content = content.strip()
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
 
-        # Scan for injection/exfiltration before accepting
+        # 扫描注入/泄露
         scan_error = _scan_memory_content(content)
         if scan_error:
             return {"success": False, "error": scan_error}
+
+        # v2: 自动或显式加 section 标签
+        if section is None:
+            section = auto_classify_section(content)
+        if section and not any(content.startswith(s) for s in ("[事实]", "[约定]", "[工具]", "[索引]", "[陷阱]", "[里程碑]")):
+            content = f"{section} {content}"
 
         with self._file_lock(self._path_for(target)):
             # Re-read from disk under lock to pick up writes from other sessions
