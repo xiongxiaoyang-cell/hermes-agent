@@ -181,7 +181,8 @@ Notable commits in `xiongxiaoyang-cell/hermes-agent` (personal fork with 出海H
 | Commit | Date | Description |
 |--------|------|-------------|
 | `89a320541` | 2026-06-20 | **feat(tools): memory_search** — unified cross-session Agent long-term memory retrieval (FTS5 sessions + lobster RAG) |
-| `b921d5f8b` | 2026-06-20 | **feat(memory_search): v2 三源合并** — session + RAG + memory_files (MEMORY.md/USER.md 全文) + 统一评分（recency × 重要性）+ 过滤参数（platform/role/days_back/country/sources）|
+| `b921d5f8b` | 2026-06-20 | **feat(memory_search): v2 三源合并** — session + RAG + memory_files（MEMORY.md/USER.md 全文）+ 统一评分（recency × 重要性）+ 过滤参数（platform/role/days_back/country/sources） |
+| `dbf74f84a` | 2026-06-20 | **feat(memory): v3 section-aware + session semantic 索引** — MEMORY.md 6 section 标签 + importance 加权（[陷阱]×2.0 最高）+ section_filter 参数 + 212 session BGE embedding 索引（16s build, /home/b4ac5686610a4ae2/rag_index/sessions）|
 | `f267016` | 2026-06-20 | **feat(skills): 同步 jd-template-fetcher** to lobster 出海HR-Skill 套装 (lobster repo) |
 | `d18bf21` | 2026-06-20 | **feat(jd): RAG 内部 JD 案例检索** — first skill RAG-upgrade (jd-template-fetcher) |
 | `68471c3` | 2026-06-20 | **feat(japan-employer-cost): RAG 政策 + 历史案例检索** — second skill RAG-upgrade (lobster repo) |
