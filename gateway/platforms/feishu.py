@@ -1347,8 +1347,14 @@ class FeishuAdapter(BasePlatformAdapter):
     # Lifecycle — init / settings / connect / disconnect
     # =========================================================================
 
-    def __init__(self, config: PlatformConfig):
+    def __init__(self, config: PlatformConfig, hooks=None):
         super().__init__(config, Platform.FEISHU)
+
+        # Optional HookRegistry (injected by gateway.run).
+        # Used to fire `file:received` event when a file/image/audio/video
+        # is downloaded from a Feishu message — lets user hooks (e.g.
+        # batch-file-deposit) auto-register incoming files.
+        self.hooks = hooks
 
         self._settings = self._load_settings(config.extra or {})
         self._apply_settings(self._settings)
@@ -3005,12 +3011,39 @@ class FeishuAdapter(BasePlatformAdapter):
             default_ext=default_ext,
         )
         cached_path = cache_document_from_bytes(body, filename)
+        await self._emit_file_received(cached_path, "remote_document")
         return cached_path, filename
 
     @staticmethod
     def _guess_remote_extension(url: str, *, default: str) -> str:
         ext = Path((url or "").split("?", 1)[0]).suffix.lower()
         return ext if ext in (_IMAGE_EXTENSIONS | _AUDIO_EXTENSIONS | _VIDEO_EXTENSIONS | set(SUPPORTED_DOCUMENT_TYPES)) else default
+
+    async def _emit_file_received(self, cached_path, context_label: str) -> None:
+        """Best-effort fire `file:received` hook (swallow errors).
+
+        Context labels:
+          - "remote_document": file downloaded from a remote URL
+          - "message_video": video resource attached to a message
+          - "message_document": document/image/audio resource attached to a message
+        """
+        hooks = getattr(self, "hooks", None)
+        if hooks is None:
+            return
+        try:
+            from pathlib import Path as _P
+            p = _P(cached_path) if cached_path else None
+            if p is None or not p.exists():
+                return
+            await hooks.emit("file:received", {
+                "path": str(p),
+                "size": p.stat().st_size,
+                "ext": p.suffix.lower(),
+                "source": "feishu",
+                "context": context_label,
+            })
+        except Exception as exc:
+            logger.debug("[Feishu] file:received hook emit failed: %s", exc)
 
     @staticmethod
     def _derive_remote_filename(file_url: str, *, content_type: str, default_name: str, default_ext: str) -> str:
@@ -3496,12 +3529,14 @@ class FeishuAdapter(BasePlatformAdapter):
                         filename = f"{filename}.mp4"
                     cached_path = cache_document_from_bytes(raw_bytes, filename)
                     logger.info("[Feishu] Cached message video resource at %s", cached_path)
+                    await self._emit_file_received(cached_path, "message_video")
                     return cached_path, media_type
 
                 if not Path(filename).suffix and media_type in _DOCUMENT_MIME_TO_EXT:
                     filename = f"{filename}{_DOCUMENT_MIME_TO_EXT[media_type]}"
                 cached_path = cache_document_from_bytes(raw_bytes, filename)
                 logger.info("[Feishu] Cached message document resource at %s", cached_path)
+                await self._emit_file_received(cached_path, "message_document")
                 return cached_path, (media_type or self._guess_document_media_type(filename))
             except Exception:
                 logger.warning(

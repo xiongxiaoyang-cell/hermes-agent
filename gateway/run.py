@@ -4490,7 +4490,7 @@ class GatewayRunner:
             domain = get_env_value("FEISHU_DOMAIN") or "feishu"
             if app_id and app_secret:
                 _rollback_secret_if_invalid(app_id, app_secret, domain)
-            return FeishuAdapter(config)
+            return FeishuAdapter(config, hooks=getattr(self, "hooks", None))
 
         elif platform == Platform.WECOM_CALLBACK:
             from gateway.platforms.wecom_callback import (
