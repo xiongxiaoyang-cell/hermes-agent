@@ -4487,7 +4487,7 @@ class GatewayRunner:
                 return None
             app_id = get_env_value("FEISHU_APP_ID")
             app_secret = get_env_value("FEISHU_APP_SECRET")
-            domain = get_env_value("FEISHU_DOMAIN", "feishu")
+            domain = get_env_value("FEISHU_DOMAIN") or "feishu"
             if app_id and app_secret:
                 _rollback_secret_if_invalid(app_id, app_secret, domain)
             return FeishuAdapter(config)
