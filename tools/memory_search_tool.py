@@ -177,17 +177,60 @@ def _rag_search(query: str, top_k: int, country: Optional[str] = None) -> List[D
 
 
 # === Source 3: memory_files（MEMORY.md + USER.md 全文） ===
-def _memory_files_search(query: str, limit: int = 3) -> List[Dict[str, Any]]:
-    """长期记忆文件全文检索（轻量级 line-by-line 匹配）"""
+# v3 改进（2026-06-20）：
+#   - 解析 § section + section 标签 [事实]/[约定]/[工具]/[索引]/[陷阱]/[里程碑]
+#   - importance 加权：[陷阱] ×2.0 / [事实][工具] ×1.5 / [约定] ×1.2 / [索引][里程碑] ×1.0 / USER ×0.8
+#   - section 过滤参数：只召回指定 section
+SECTION_LABELS = ("[事实]", "[约定]", "[工具]", "[索引]", "[陷阱]", "[里程碑]")
+
+# section 重要性权重
+SECTION_IMPORTANCE = {
+    "[事实]":   1.5,
+    "[约定]":   1.2,
+    "[工具]":   1.5,
+    "[索引]":   1.0,
+    "[陷阱]":   2.0,  # 最高（避坑优先）
+    "[里程碑]": 1.0,
+}
+
+
+def _parse_memory_sections(content: str) -> list:
+    """解析 MEMORY.md/USER.md 的 § section，返回 [(section_label, content_text)]"""
+    sections = []
+    for entry in content.split("§"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        # 检测 section 标签（[事实] / [约定] / ...）
+        label = ""
+        for lbl in SECTION_LABELS:
+            if entry.startswith(lbl):
+                label = lbl
+                break
+        if not label:
+            # 检查 [USER] 等其他 label
+            for lbl in SECTION_LABELS + ("[USER]",):
+                if entry.startswith(lbl):
+                    label = lbl
+                    break
+        sections.append((label, entry))
+    return sections
+
+
+def _memory_files_search(query: str, limit: int = 3, section_filter: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """长期记忆文件全文检索（v3：section 解析 + importance 加权）"""
     results = []
     files = [
         ("MEMORY.md", "memory"),
         ("USER.md", "user"),
     ]
-    # 提取 query 关键词（中文按 2-gram 切分，英文按 word 切分）
+    # 提取 query 关键词
     keywords = _extract_keywords(query)
     if not keywords:
         return []
+
+    # 解析 section 过滤
+    filter_labels = set(section_filter) if section_filter else set()
 
     for fname, stype in files:
         fpath = MEMORY_DIR / fname
@@ -197,30 +240,38 @@ def _memory_files_search(query: str, limit: int = 3) -> List[Dict[str, Any]]:
             content = fpath.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             continue
-        lines = content.split("\n")
-        hits = []
-        for i, line in enumerate(lines):
-            count = sum(1 for kw in keywords if kw in line)
-            if count > 0:
-                hits.append((i, line, count))
-        # 取最相关的前 N 行
-        hits.sort(key=lambda x: x[2], reverse=True)
-        for i, line, count in hits[:limit]:
-            # 上下文（前后 1 行）
-            ctx_start = max(0, i - 1)
-            ctx_end = min(len(lines), i + 2)
-            ctx = "\n".join(lines[ctx_start:ctx_end])
-            # 标准化 unified_score：命中数 × 文件大小权重
-            score = min(count * 0.5, 2.0)
+
+        # 解析为 sections
+        sections = _parse_memory_sections(content)
+        for label, section_text in sections:
+            # section 过滤
+            if filter_labels and label not in filter_labels:
+                continue
+            # 计算关键词命中
+            count = sum(1 for kw in keywords if kw in section_text)
+            if count == 0:
+                continue
+            # importance 加权
+            importance = SECTION_IMPORTANCE.get(label, 0.8 if stype == "user" else 1.0)
+            score = min(count * 0.5 * importance, 3.0)
+            # 取 section 中含关键词的 snippet
+            lines = section_text.split("\n")
+            best_snip = max(
+                (line for line in lines if any(kw in line for kw in keywords)),
+                key=len,
+                default=section_text[:200]
+            )
             results.append({
                 "source": "memory_file",
                 "memory_type": stype,  # "memory" or "user"
+                "section_label": label or "(无标签)",
                 "path": f"~/.hermes/memories/{fname}",
-                "snippet": line[:300],
-                "context": ctx[:500],
+                "snippet": best_snip[:300],
+                "full_section": section_text[:500],
                 "unified_score": round(score, 2),
                 "score_breakdown": {
                     "keyword_hits": count,
+                    "importance_weight": importance,
                 },
             })
 
@@ -266,10 +317,11 @@ def memory_search(
     days_back: Optional[int] = None,
     country: Optional[str] = None,
     sources: Optional[List[str]] = None,
+    section_filter: Optional[List[str]] = None,
     current_session_id: Optional[str] = None,
 ) -> str:
     """
-    跨会话长期记忆检索（v2：三源 + 统一评分）
+    跨会话长期记忆检索（v3：section-aware + importance 加权）
 
     Args:
         query: 检索关键词
@@ -279,6 +331,7 @@ def memory_search(
         days_back: 只看最近 N 天的 session（默认不限）
         country: RAG 国别过滤（03_区域政策/ 下的 country metadata）
         sources: 白名单 list（["session", "rag", "memory_file"]），默认全开
+        section_filter: 记忆文件 section 过滤（["[事实]", "[工具]", "[陷阱]", ...]），默认全开
     """
     if not query or not query.strip():
         return tool_error("query is required", success=False)
@@ -308,16 +361,16 @@ def memory_search(
             logger.exception("rag search failed")
             all_results.append({"source": "rag", "error": str(e)})
 
-    # Source 3: memory_files
+    # Source 3: memory_files（v3：section_filter 透传）
     if "memory_file" in srcs:
         try:
-            mem = _memory_files_search(query, limit=3)
+            mem = _memory_files_search(query, limit=3, section_filter=section_filter)
             all_results.extend(mem)
         except Exception as e:
             logger.exception("memory_files search failed")
             all_results.append({"source": "memory_file", "error": str(e)})
 
-    # 跨源 unified_score 排序（rag 距离越小越好，已转 0-1；session 是重要性；memory 是命中数）
+    # 跨源 unified_score 排序
     all_results.sort(key=lambda r: r.get("unified_score", 0), reverse=True)
 
     return json.dumps({
@@ -329,6 +382,7 @@ def memory_search(
             "days_back": days_back,
             "country": country,
             "sources": list(srcs),
+            "section_filter": section_filter,
         },
         "results": all_results[:limit * 3],  # 总条数限制
         "summary": {
@@ -345,12 +399,16 @@ def memory_search(
 MEMORY_SEARCH_SCHEMA: Dict[str, Any] = {
     "name": "memory_search",
     "description": (
-        "跨会话长期记忆检索 v2：三源合并（session FTS5 + RAG Chroma + memory_files 全文）+ 统一评分排序。\n\n"
+        "跨会话长期记忆检索 v3：section-aware + importance 加权 + 三源合并。\n\n"
         "适用场景：\n"
         "  - 用户问'我们之前讨论过 X 吗' → 检索 session 找到对话历史\n"
         "  - 用户问'X 的最新数据/政策/文档' → 检索 RAG 找到项目知识\n"
         "  - 用户问'X 的方法论/约定/原则是什么' → 检索 memory_files（MEMORY.md / USER.md）\n"
         "  - 综合查询 → 三源合并，按 unified_score 倒序返回\n\n"
+        "v3 改进（2026-06-20）：\n"
+        "  - MEMORY.md 结构化（[事实]/[约定]/[工具]/[索引]/[陷阱]/[里程碑] 6 section 标签）\n"
+        "  - importance 加权：[陷阱]×2.0 / [事实][工具]×1.5 / [约定]×1.2 / [索引][里程碑]×1.0 / USER×0.8\n"
+        "  - section_filter 参数：只召回指定 section\n\n"
         "v2 改进（2026-06-20）：\n"
         "  - 新增 memory_files 源（MEMORY.md + USER.md 全文检索）\n"
         "  - 新增过滤参数：platform / role / days_back / country / sources\n"
@@ -393,6 +451,11 @@ MEMORY_SEARCH_SCHEMA: Dict[str, Any] = {
                 "items": {"type": "string", "enum": ["session", "rag", "memory_file"]},
                 "description": "白名单（默认全开）",
             },
+            "section_filter": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["[事实]", "[约定]", "[工具]", "[索引]", "[陷阱]", "[里程碑]"]},
+                "description": "MEMORY.md/USER.md section 过滤（默认全开，可指定 [陷阱] 只查避坑）",
+            },
         },
         "required": ["query"],
     },
@@ -411,6 +474,7 @@ registry.register(
         days_back=args.get("days_back"),
         country=args.get("country"),
         sources=args.get("sources"),
+        section_filter=args.get("section_filter"),
         current_session_id=kw.get("current_session_id"),
     ),
     check_fn=lambda: True,  # 永远可用（依赖 RAG 本地索引 + session DB + memory files）
